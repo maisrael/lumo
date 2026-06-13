@@ -1023,7 +1023,7 @@ final class PowerModel: ObservableObject {
     func startPolling() {
         stopPolling()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
     func stopPolling() { timer?.invalidate(); timer = nil }
@@ -1063,8 +1063,9 @@ final class PowerModel: ObservableObject {
             (IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?
                 .takeRetainedValue() as? NSNumber)?.intValue
         }
-        let amperage = int("Amperage") ?? 0   // mA, signed
-        let voltage = int("Voltage") ?? 0      // mV
+        // InstantAmperage reacts faster than the averaged Amperage.
+        let amperage = int("InstantAmperage") ?? int("Amperage") ?? 0   // mA, signed
+        let voltage = int("Voltage") ?? 0                               // mV
         i.batteryWatts = Double(amperage) * Double(voltage) / 1_000_000.0
         if let adapter = IORegistryEntryCreateCFProperty(service, "AdapterDetails" as CFString,
                                                          kCFAllocatorDefault, 0)?.takeRetainedValue() as? [String: Any] {
