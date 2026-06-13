@@ -25,7 +25,11 @@
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Lumo lists and connects your paired Bluetooth audio devices.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>Lumo needs Location access to scan for nearby Wi-Fi networks (a macOS requirement).</string>
+    <string>Lumo needs Location access to scan for nearby Wi-Fi networks and show local weather.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Lumo shows your upcoming events in the Calendar tab.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Lumo shows your upcoming events in the Calendar tab.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

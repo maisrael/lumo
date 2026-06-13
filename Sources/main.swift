@@ -8,6 +8,7 @@ import IOKit
 import IOKit.ps
 import CoreWLAN
 import CoreLocation
+import EventKit
 
 // MARK: - Gruvbox palette
 
@@ -40,7 +41,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, network, unifi, vpn, home, ai, system
+    case calendar, timer, music, sound, power, network, unifi, vpn, home, pi, ai, system
 
     var id: String { rawValue }
 
@@ -55,6 +56,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .unifi:    return "UniFi"
         case .vpn:      return "VPN"
         case .home:     return "Home"
+        case .pi:       return "Pi"
         case .ai:       return "AI"
         case .system:   return "System"
         }
@@ -71,6 +73,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .unifi:    return "shield.lefthalf.filled"
         case .vpn:      return "lock.fill"
         case .home:     return "house.fill"
+        case .pi:       return "server.rack"
         case .ai:       return "sparkles"
         case .system:   return "slider.horizontal.3"
         }
@@ -115,6 +118,8 @@ final class PanelState: ObservableObject {
 
 struct PanelView: View {
     @ObservedObject var state: PanelState
+    @ObservedObject var weather: WeatherModel
+    @ObservedObject var events: EventsModel
     @ObservedObject var timer: TimerModel
     @ObservedObject var nowPlaying: NowPlayingModel
     @ObservedObject var sound: SoundModel
@@ -124,6 +129,7 @@ struct PanelView: View {
     @ObservedObject var unifi: UniFiModel
     @ObservedObject var vpn: VPNModel
     @ObservedObject var ha: HAModel
+    @ObservedObject var pi: PiModel
     @ObservedObject var ai: AIModel
     @ObservedObject var system: SystemModel
 
@@ -133,12 +139,12 @@ struct PanelView: View {
             Rectangle().fill(Gruv.bg3.opacity(0.4)).frame(width: 1)
             content
         }
-        .frame(width: 380, height: 600)
+        .frame(width: 430, height: 600)
         .background(Gruv.bg0.opacity(0.72))
     }
 
     private var rail: some View {
-        VStack(spacing: 9) {
+        VStack(spacing: 7) {
             ForEach(Tab.allCases) { t in
                 RailIcon(tab: t, isActive: state.tab == t) { state.tab = t }
             }
@@ -160,7 +166,7 @@ struct PanelView: View {
 
             Group {
                 switch state.tab {
-                case .calendar: CalendarTab()
+                case .calendar: CalendarTab(weather: weather, events: events)
                 case .timer:    TimerView(model: timer)
                 case .music:    MusicTab(model: nowPlaying)
                 case .sound:    SoundTab(model: sound, bt: bluetooth)
@@ -169,6 +175,7 @@ struct PanelView: View {
                 case .unifi:    UniFiTab(model: unifi)
                 case .vpn:      VPNTab(model: vpn)
                 case .home:     HATab(model: ha)
+                case .pi:       PiTab(model: pi)
                 case .ai:       AITab(model: ai)
                 case .system:   SystemTab(model: system)
                 }
@@ -193,7 +200,7 @@ struct RailIcon: View {
         Button(action: action) {
             Image(systemName: tab.symbol)
                 .font(.system(size: 16, weight: .medium))
-                .frame(width: 42, height: 42)
+                .frame(width: 40, height: 40)
                 .background(
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
                         .fill(fill)
@@ -216,19 +223,217 @@ struct RailIcon: View {
 
 // MARK: - Tab bodies
 
+// MARK: - World cities (shared by the clocks + weather)
+
+struct WorldCity: Identifiable {
+    let name: String
+    let tzID: String
+    let lat: Double
+    let lon: Double
+    var id: String { name }
+    var tz: TimeZone { TimeZone(identifier: tzID)! }
+}
+
+let worldCities: [WorldCity] = [
+    WorldCity(name: "Helsinki",     tzID: "Europe/Helsinki",     lat: 60.1699, lon: 24.9384),
+    WorldCity(name: "Kuala Lumpur", tzID: "Asia/Kuala_Lumpur",   lat:  3.1390, lon: 101.6869),
+    WorldCity(name: "Málaga",       tzID: "Europe/Madrid",       lat: 36.7213, lon: -4.4214),
+]
+
+// MARK: - Weather (Open-Meteo, no API key — one request for all clock cities)
+
+struct WeatherNow: Equatable {
+    var tempC = 0.0
+    var hiC = 0.0
+    var loC = 0.0
+    var code = 0
+    var loaded = false
+}
+
+final class WeatherModel: ObservableObject {
+    @Published var byCity: [String: WeatherNow] = [:]
+    private var lastFetch = Date.distantPast
+
+    func refresh() {
+        // Weather changes slowly — refetch at most every 10 min (always on first load).
+        guard byCity.isEmpty || Date().timeIntervalSince(lastFetch) > 600 else { return }
+        let lats = worldCities.map { String($0.lat) }.joined(separator: ",")
+        let lons = worldCities.map { String($0.lon) }.joined(separator: ",")
+        let s = "https://api.open-meteo.com/v1/forecast?latitude=\(lats)&longitude=\(lons)"
+            + "&current=temperature_2m,weather_code"
+            + "&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1"
+        guard let url = URL(string: s) else { return }
+        lastFetch = Date()
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data else { return }
+            // Multi-location → array; single → object. Handle both.
+            var items: [[String: Any]] = []
+            if let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                items = arr
+            } else if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                items = [obj]
+            }
+            var result: [String: WeatherNow] = [:]
+            for (i, item) in items.enumerated() where i < worldCities.count {
+                var w = WeatherNow()
+                if let cur = item["current"] as? [String: Any] {
+                    w.tempC = cur["temperature_2m"] as? Double ?? 0
+                    w.code = cur["weather_code"] as? Int ?? 0
+                }
+                if let daily = item["daily"] as? [String: Any] {
+                    w.hiC = (daily["temperature_2m_max"] as? [Double])?.first ?? 0
+                    w.loC = (daily["temperature_2m_min"] as? [Double])?.first ?? 0
+                }
+                w.loaded = true
+                result[worldCities[i].name] = w
+            }
+            DispatchQueue.main.async { self?.byCity = result }
+        }.resume()
+    }
+}
+
+enum WeatherIcon {
+    // WMO weather code → SF Symbol.
+    static func symbol(_ c: Int) -> String {
+        switch c {
+        case 0:            return "sun.max.fill"
+        case 1, 2:         return "cloud.sun.fill"
+        case 3:            return "cloud.fill"
+        case 45, 48:       return "cloud.fog.fill"
+        case 51...57:      return "cloud.drizzle.fill"
+        case 61...67:      return "cloud.rain.fill"
+        case 71...77, 85, 86: return "cloud.snow.fill"
+        case 80...82:      return "cloud.heavyrain.fill"
+        case 95...99:      return "cloud.bolt.rain.fill"
+        default:           return "cloud.fill"
+        }
+    }
+    static func tint(_ c: Int) -> Color {
+        switch c {
+        case 0:        return Gruv.yellow
+        case 1, 2:     return Gruv.fg2
+        case 95...99:  return Gruv.red
+        default:       return Gruv.blue
+        }
+    }
+}
+
+// MARK: - Calendar events (EventKit)
+
+struct CalEvent: Identifiable {
+    let id: String
+    let title: String
+    let start: Date
+    let allDay: Bool
+    let color: Color
+}
+
+final class EventsModel: ObservableObject {
+    @Published var events: [CalEvent] = []
+    @Published var access = false
+    @Published var asked = false
+    private let store = EKEventStore()
+
+    func refresh() {
+        let done: (Bool) -> Void = { [weak self] granted in
+            DispatchQueue.main.async {
+                self?.access = granted; self?.asked = true
+                if granted { self?.load() }
+            }
+        }
+        if #available(macOS 14.0, *) {
+            store.requestFullAccessToEvents { granted, _ in done(granted) }
+        } else {
+            store.requestAccess(to: .event) { granted, _ in done(granted) }
+        }
+    }
+
+    private func load() {
+        let cal = Calendar.current
+        let start = Date()
+        guard let end = cal.date(byAdding: .day, value: 7, to: cal.startOfDay(for: start)) else { return }
+        let pred = store.predicateForEvents(withStart: start, end: end, calendars: nil)
+        let evs = store.events(matching: pred)
+            .sorted { $0.startDate < $1.startDate }
+            .prefix(3)
+            .map { e -> CalEvent in
+                var col = Gruv.blue
+                if let cg = e.calendar.cgColor { col = Color(cgColor: cg) }
+                return CalEvent(id: e.eventIdentifier ?? UUID().uuidString,
+                                title: e.title ?? "(no title)",
+                                start: e.startDate, allDay: e.isAllDay, color: col)
+            }
+        let out = Array(evs)
+        DispatchQueue.main.async { self.events = out }
+    }
+}
+
+struct EventsList: View {
+    @ObservedObject var model: EventsModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Upcoming").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+            if model.asked && !model.access {
+                Text("Calendar access denied — enable in Settings ▸ Privacy")
+                    .font(.caption).foregroundStyle(Gruv.gray)
+            } else if model.events.isEmpty {
+                Text("Nothing in the next 7 days").font(.caption).foregroundStyle(Gruv.gray)
+            } else {
+                ForEach(model.events) { e in row(e) }
+            }
+        }
+    }
+
+    private func row(_ e: CalEvent) -> some View {
+        Button { AppLauncher.open("com.apple.iCal") } label: {
+            HStack(spacing: 9) {
+                RoundedRectangle(cornerRadius: 2).fill(e.color).frame(width: 3, height: 26)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(e.title).font(.callout).foregroundStyle(Gruv.fg1).lineLimit(1)
+                    Text(when(e)).font(.caption2).foregroundStyle(Gruv.gray)
+                }
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func when(_ e: CalEvent) -> String {
+        let cal = Calendar.current
+        let f = DateFormatter()
+        f.timeZone = TimeZone(identifier: "Europe/Helsinki")
+        if e.allDay {
+            f.dateFormat = cal.isDateInToday(e.start) ? "'Today · all day'" : "EEE d · 'all day'"
+            return f.string(from: e.start)
+        }
+        if cal.isDateInToday(e.start) { f.dateFormat = "'Today' HH:mm" }
+        else if cal.isDateInTomorrow(e.start) { f.dateFormat = "'Tomorrow' HH:mm" }
+        else { f.dateFormat = "EEE d · HH:mm" }
+        return f.string(from: e.start)
+    }
+}
+
 struct CalendarTab: View {
+    @ObservedObject var weather: WeatherModel
+    @ObservedObject var events: EventsModel
+
     private var today: String {
         let f = DateFormatter()
         f.dateFormat = "EEEE, d MMMM"
         f.timeZone = TimeZone(identifier: "Europe/Helsinki")
         return f.string(from: Date())
     }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 13) {
             Text(today)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Gruv.fg0)
-            WorldClocksView()
+            WorldClocksView(weather: weather)
+            Rectangle().fill(Gruv.bg3.opacity(0.45)).frame(height: 1)
+            EventsList(model: events)
             Rectangle().fill(Gruv.bg3.opacity(0.45)).frame(height: 1)
             MiniCalendar()
         }
@@ -286,26 +491,21 @@ struct MiniCalendar: View {
 }
 
 struct WorldClocksView: View {
-    private struct City { let name: String; let tz: TimeZone }
+    @ObservedObject var weather: WeatherModel
     private let home = TimeZone(identifier: "Europe/Helsinki")!
-    private var cities: [City] {
-        [City(name: "Helsinki",     tz: TimeZone(identifier: "Europe/Helsinki")!),
-         City(name: "Kuala Lumpur", tz: TimeZone(identifier: "Asia/Kuala_Lumpur")!),
-         City(name: "Málaga",       tz: TimeZone(identifier: "Europe/Madrid")!)]
-    }
 
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 1)) { ctx in
             VStack(spacing: 14) {
-                ForEach(cities, id: \.name) { row($0, now: ctx.date) }
+                ForEach(worldCities) { row($0, now: ctx.date) }
             }
         }
     }
 
     @ViewBuilder
-    private func row(_ city: City, now: Date) -> some View {
-        let isHome = city.tz.identifier == home.identifier
-        HStack(alignment: .firstTextBaseline) {
+    private func row(_ city: WorldCity, now: Date) -> some View {
+        let isHome = city.tzID == home.identifier
+        HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(city.name)
                     .font(.callout.weight(.medium))
@@ -315,13 +515,34 @@ struct WorldClocksView: View {
                     .foregroundStyle(isHome ? Gruv.aqua : Gruv.gray)
             }
             Spacer()
+            chip(city)
             Text(timeString(city.tz, now))
                 .font(.system(.title2, design: .rounded).weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(isHome ? Gruv.fg0 : Gruv.fg1)
+                .frame(minWidth: 58, alignment: .trailing)
         }
         .contentShape(Rectangle())
         .onTapGesture { AppLauncher.open("com.apple.clock") }
+    }
+
+    @ViewBuilder
+    private func chip(_ city: WorldCity) -> some View {
+        if let w = weather.byCity[city.name], w.loaded {
+            HStack(spacing: 6) {
+                Image(systemName: WeatherIcon.symbol(w.code))
+                    .font(.system(size: 15))
+                    .foregroundStyle(WeatherIcon.tint(w.code))
+                    .symbolRenderingMode(.multicolor)
+                    .frame(width: 18)
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text("\(Int(w.tempC.rounded()))°")
+                        .font(.callout.weight(.medium)).foregroundStyle(Gruv.fg1).monospacedDigit()
+                    Text("\(Int(w.hiC.rounded()))°/\(Int(w.loC.rounded()))°")
+                        .font(.system(size: 9)).foregroundStyle(Gruv.gray).monospacedDigit()
+                }
+            }
+        }
     }
 
     private func timeString(_ tz: TimeZone, _ now: Date) -> String {
@@ -329,8 +550,8 @@ struct WorldClocksView: View {
         return f.string(from: now)
     }
 
-    private func subtitle(_ city: City, now: Date) -> String {
-        if city.tz.identifier == home.identifier { return "home" }
+    private func subtitle(_ city: WorldCity, now: Date) -> String {
+        if city.tzID == home.identifier { return "home" }
         let diff = (city.tz.secondsFromGMT(for: now) - home.secondsFromGMT(for: now)) / 3600
         let dayF = DateFormatter(); dayF.timeZone = city.tz; dayF.dateFormat = "EEE"
         return "\(dayF.string(from: now)) · \(diff >= 0 ? "+" : "")\(diff)h"
@@ -780,18 +1001,24 @@ enum AudioSystem {
         AudioObjectSetPropertyData(sys, &addr, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &dev)
     }
 
-    // Volume on the current default output (virtual main element).
+    // Volume on the current default output. Many devices (Bluetooth, DACs,
+    // aggregates) expose no main-element volume — it lives on channels 1/2 —
+    // so fall back to averaging those, mirroring setVolume's element list.
     static func volume() -> Float {
         let dev = defaultDevice(output: true)
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        var v: Float32 = 0
-        var size = UInt32(MemoryLayout<Float32>.size)
-        if AudioObjectHasProperty(dev, &addr) {
-            AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &v)
+        func read(_ element: AudioObjectPropertyElement) -> Float? {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput, mElement: element)
+            guard AudioObjectHasProperty(dev, &addr) else { return nil }
+            var v: Float32 = 0
+            var size = UInt32(MemoryLayout<Float32>.size)
+            guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &v) == noErr else { return nil }
+            return v
         }
-        return v
+        if let main = read(kAudioObjectPropertyElementMain) { return main }
+        let channels = [read(1), read(2)].compactMap { $0 }
+        return channels.isEmpty ? 0 : channels.reduce(0, +) / Float(channels.count)
     }
 
     static func setVolume(_ value: Float) {
@@ -2238,6 +2465,354 @@ struct AITab: View {
     }
 }
 
+// MARK: - Pi (home-server health via the lumo-health container)
+
+struct PiContainer: Identifiable, Codable, Equatable {
+    var id: String { name }
+    var name: String
+    var state: String          // running, exited, restarting, …
+    var health: String?        // healthy, unhealthy, starting, or nil
+}
+
+struct PiStatus: Codable, Equatable {
+    var reachable = false
+    var source = ""            // "lan" (live) or "cloud" (S3 snapshot via CloudFront)
+    var tsEpoch = 0            // payload "ts" — snapshot age for staleness
+    var hostname = ""
+    var uptimeSec = 0
+    var cpuPercent = 0.0
+    var cpuCount = 0
+    var memUsedMB = 0
+    var memTotalMB = 0
+    var memPercent = 0.0
+    var diskUsedGB = 0.0
+    var diskTotalGB = 0.0
+    var diskPercent = 0.0
+    var tempC: Double? = nil
+    var load: [Double] = []
+    var containers: [PiContainer] = []
+}
+
+final class PiModel: ObservableObject {
+    @Published var status = PiStatus()
+    @Published var loading = false
+    @Published private(set) var everLoaded = false
+    @Published var configured = false
+
+    private var local = "", remote = "", remoteHeader = "X-Lumo-Token", remoteToken = ""
+    private var session: URLSession!
+    private var timer: Timer?
+    // A cloud snapshot older than this means the Pi stopped pushing → it's down.
+    static let staleAfter: TimeInterval = 150
+
+    init() {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 6
+        session = URLSession(configuration: cfg)
+        loadConfig()
+        if let data = UserDefaults.standard.data(forKey: "pi.cache"),
+           let cached = try? JSONDecoder().decode(PiStatus.self, from: data) {
+            status = cached
+        }
+    }
+
+    private func loadConfig() {
+        let path = NSHomeDirectory() + "/.config/lumo/pi.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            configured = false; return
+        }
+        // `local` (LAN) with `url` accepted as a legacy alias; `remote` (CloudFront) optional.
+        local = (j["local"] as? String ?? j["url"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        remote = (j["remote"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        remoteHeader = (j["remoteHeader"] as? String ?? "X-Lumo-Token")
+        remoteToken = (j["remoteToken"] as? String ?? "")
+        configured = !local.isEmpty || !remote.isEmpty
+    }
+
+    func startPolling() {
+        guard configured else { return }
+        stopPolling(); refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+    func stopPolling() { timer?.invalidate(); timer = nil }
+
+    func refresh() {
+        guard configured else { return }
+        loading = true
+        // LAN first (live, fast). Fall back to the CloudFront snapshot when away.
+        fetch(local, timeoutOverride: 2.5) { [weak self] lan in
+            guard let self else { return }
+            if var s = lan { s.source = "lan"; self.apply(s); return }
+            guard !self.remote.isEmpty else { self.markUnreachable(); return }
+            var req = URLRequest(url: URL(string: self.remote)!)
+            if !self.remoteToken.isEmpty { req.setValue(self.remoteToken, forHTTPHeaderField: self.remoteHeader) }
+            self.fetch(req) { cloud in
+                if var s = cloud { s.source = "cloud"; self.apply(s) }
+                else { self.markUnreachable() }
+            }
+        }
+    }
+
+    private func apply(_ incoming: PiStatus) {
+        var s = incoming
+        // A stale cloud snapshot = the Pi stopped pushing = it's down.
+        if s.source == "cloud", s.tsEpoch > 0,
+           Date().timeIntervalSince1970 - Double(s.tsEpoch) > Self.staleAfter {
+            s.reachable = false
+        }
+        DispatchQueue.main.async {
+            self.loading = false
+            self.everLoaded = true
+            self.status = s
+            if let enc = try? JSONEncoder().encode(s) {
+                UserDefaults.standard.set(enc, forKey: "pi.cache")   // keep last view for instant open
+            }
+        }
+    }
+
+    private func markUnreachable() {
+        DispatchQueue.main.async {
+            self.loading = false
+            self.everLoaded = true
+            self.status.reachable = false       // keep cached metrics, just flag offline
+            self.status.source = ""
+        }
+    }
+
+    private func fetch(_ urlString: String, timeoutOverride: TimeInterval,
+                       completion: @escaping (PiStatus?) -> Void) {
+        guard let url = URL(string: urlString) else { completion(nil); return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = timeoutOverride
+        fetch(req, completion: completion)
+    }
+
+    private func fetch(_ req: URLRequest, completion: @escaping (PiStatus?) -> Void) {
+        session.dataTask(with: req) { data, resp, _ in
+            guard (resp as? HTTPURLResponse)?.statusCode == 200, let data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let host = j["host"] as? [String: Any] else { completion(nil); return }
+            var s = PiStatus()
+            s.reachable = true
+            s.tsEpoch = j["ts"] as? Int ?? 0
+            s.hostname = host["hostname"] as? String ?? ""
+            s.uptimeSec = host["uptime_sec"] as? Int ?? 0
+            s.cpuPercent = host["cpu_percent"] as? Double ?? 0
+            s.cpuCount = host["cpu_count"] as? Int ?? 0
+            s.tempC = host["temp_c"] as? Double
+            s.load = (host["load"] as? [Double]) ?? []
+            if let m = host["mem"] as? [String: Any] {
+                s.memUsedMB = m["used_mb"] as? Int ?? 0
+                s.memTotalMB = m["total_mb"] as? Int ?? 0
+                s.memPercent = m["percent"] as? Double ?? 0
+            }
+            if let d = host["disk"] as? [String: Any] {
+                s.diskUsedGB = d["used_gb"] as? Double ?? 0
+                s.diskTotalGB = d["total_gb"] as? Double ?? 0
+                s.diskPercent = d["percent"] as? Double ?? 0
+            }
+            if let cs = j["containers"] as? [[String: Any]] {
+                s.containers = cs.map {
+                    PiContainer(name: $0["name"] as? String ?? "?",
+                                state: $0["state"] as? String ?? "",
+                                health: $0["health"] as? String)
+                }
+            }
+            completion(s)
+        }.resume()
+    }
+}
+
+struct PiTab: View {
+    @ObservedObject var model: PiModel
+
+    var body: some View {
+        let s = model.status
+        if !model.configured {
+            hint("No Pi config", "Add ~/.config/lumo/pi.json")
+        } else if !s.reachable && !model.everLoaded && s.hostname.isEmpty {
+            hint("Connecting…", "Reaching the Pi")
+        } else {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 14) {
+                    header(s)
+                    if !s.reachable {
+                        offlineBanner
+                    }
+                    metrics(s)
+                    if !s.containers.isEmpty { containerList(s) }
+                }
+                .padding(.bottom, 8)
+                .opacity(s.reachable ? 1 : 0.55)      // dim stale data when offline
+            }
+        }
+    }
+
+    private func header(_ s: PiStatus) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 22))
+                .foregroundStyle(s.reachable ? Gruv.green : Gruv.red)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(s.hostname.isEmpty ? "Raspberry Pi" : s.hostname)
+                    .font(.headline).foregroundStyle(Gruv.fg0)
+                Text(s.reachable ? "Online · up \(uptime(s.uptimeSec))" : "Offline")
+                    .font(.caption).foregroundStyle(s.reachable ? Gruv.green : Gruv.red)
+            }
+            Spacer()
+            if s.reachable, !s.source.isEmpty {
+                sourceBadge(s.source)
+            } else if model.loading && !model.everLoaded {
+                Text("updating…").font(.caption2).foregroundStyle(Gruv.gray)
+            }
+        }
+    }
+
+    // Where the data came from: LAN = live, cloud = S3 snapshot via CloudFront.
+    private func sourceBadge(_ source: String) -> some View {
+        let lan = source == "lan"
+        return HStack(spacing: 4) {
+            Image(systemName: lan ? "wifi" : "cloud.fill").font(.system(size: 9))
+            Text(lan ? "LAN" : "cloud")
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(lan ? Gruv.green : Gruv.blue)
+        .padding(.vertical, 3).padding(.horizontal, 7)
+        .background(Capsule().fill((lan ? Gruv.green : Gruv.blue).opacity(0.15)))
+    }
+
+    private var offlineBanner: some View {
+        let ts = model.status.tsEpoch
+        let msg = ts > 0
+            ? "Pi stopped reporting — last seen \(lastSeen(ts))"
+            : "Health endpoint unreachable — Pi may be down"
+        return HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Gruv.red)
+            Text(msg).font(.caption).foregroundStyle(Gruv.fg2)
+        }
+        .padding(.vertical, 7).padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 9).fill(Gruv.red.opacity(0.12)))
+    }
+
+    private func lastSeen(_ tsEpoch: Int) -> String {
+        let secs = max(0, Int(Date().timeIntervalSince1970) - tsEpoch)
+        if secs < 90 { return "\(secs)s ago" }
+        let m = secs / 60
+        if m < 60 { return "\(m)m ago" }
+        let h = m / 60
+        return h < 24 ? "\(h)h ago" : "\(h / 24)d ago"
+    }
+
+    private func metrics(_ s: PiStatus) -> some View {
+        VStack(spacing: 9) {
+            bar("CPU", s.cpuPercent, "\(Int(s.cpuPercent))%")
+            bar("RAM", s.memPercent, "\(gb(s.memUsedMB)) / \(gb(s.memTotalMB))")
+            bar("Disk", s.diskPercent, String(format: "%.0f / %.0f GB", s.diskUsedGB, s.diskTotalGB))
+            HStack(spacing: 14) {
+                if let t = s.tempC {
+                    pill("thermometer.medium", String(format: "%.0f°C", t), tempColor(t))
+                }
+                if !s.load.isEmpty {
+                    pill("gauge.with.dots.needle.50percent",
+                         s.load.map { String(format: "%.2f", $0) }.joined(separator: " "), Gruv.fg2)
+                }
+                Spacer()
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private func bar(_ label: String, _ percent: Double, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label).font(.caption.weight(.medium)).foregroundStyle(Gruv.fg4)
+                Spacer()
+                Text(value).font(.caption).foregroundStyle(Gruv.fg1).monospacedDigit()
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Gruv.bg3.opacity(0.5))
+                    Capsule().fill(loadColor(percent))
+                        .frame(width: geo.size.width * min(1, max(0, percent / 100)))
+                }
+            }
+            .frame(height: 5)
+        }
+    }
+
+    private func pill(_ icon: String, _ text: String, _ color: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.caption2)
+            Text(text).font(.caption).monospacedDigit()
+        }
+        .foregroundStyle(color)
+        .padding(.vertical, 4).padding(.horizontal, 9)
+        .background(Capsule().fill(Gruv.bg1.opacity(0.6)))
+    }
+
+    private func containerList(_ s: PiStatus) -> some View {
+        let running = s.containers.filter { $0.state == "running" }.count
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Containers").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                Spacer()
+                Text("\(running)/\(s.containers.count) up").font(.caption2).foregroundStyle(Gruv.gray)
+            }
+            ForEach(s.containers) { c in
+                HStack(spacing: 9) {
+                    Circle().fill(dotColor(c)).frame(width: 7, height: 7)
+                    Text(c.name).foregroundStyle(c.state == "running" ? Gruv.fg1 : Gruv.fg4).lineLimit(1)
+                    Spacer()
+                    Text(label(c)).font(.caption).foregroundStyle(dotColor(c))
+                }
+                .font(.callout)
+                .padding(.vertical, 3)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func label(_ c: PiContainer) -> String {
+        if let h = c.health { return h }
+        return c.state
+    }
+
+    private func dotColor(_ c: PiContainer) -> Color {
+        if c.state != "running" { return Gruv.red }
+        switch c.health {
+        case "healthy": return Gruv.green
+        case "unhealthy": return Gruv.red
+        case "starting": return Gruv.yellow
+        default: return Gruv.green       // running, no healthcheck defined
+        }
+    }
+
+    private func loadColor(_ p: Double) -> Color {
+        switch p { case ..<60: return Gruv.green; case ..<85: return Gruv.yellow; default: return Gruv.red }
+    }
+    private func tempColor(_ t: Double) -> Color {
+        switch t { case ..<60: return Gruv.green; case ..<75: return Gruv.yellow; default: return Gruv.red }
+    }
+
+    private func gb(_ mb: Int) -> String {
+        mb >= 1024 ? String(format: "%.1fG", Double(mb) / 1024) : "\(mb)M"
+    }
+    private func uptime(_ s: Int) -> String {
+        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+        if d > 0 { return "\(d)d \(h)h" }
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
+
+    private func hint(_ title: String, _ sub: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline).foregroundStyle(Gruv.fg2)
+            Text(sub).font(.callout).foregroundStyle(Gruv.gray)
+        }.padding(.top, 8)
+    }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -2253,6 +2828,8 @@ final class FloatingPanel: NSPanel {
 
 final class PanelController {
     let state = PanelState()
+    let weather = WeatherModel()
+    let events = EventsModel()
     let timer = TimerModel()
     let nowPlaying = NowPlayingModel()
     let sound = SoundModel()
@@ -2262,13 +2839,14 @@ final class PanelController {
     let unifi = UniFiModel()
     let vpn = VPNModel()
     let ha = HAModel()
+    let pi = PiModel()
     let ai = AIModel()
     let system = SystemModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
-    private let size = NSSize(width: 380, height: 600)
+    private let size = NSSize(width: 430, height: 600)
 
     init() {
         let visual = NSVisualEffectView()
@@ -2281,7 +2859,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, ai: ai, system: system))
+        let hosting = NSHostingView(rootView: PanelView(state: state, weather: weather, events: events, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, pi: pi, ai: ai, system: system))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -2311,6 +2889,7 @@ final class PanelController {
     }
 
     private func updatePolling(forTab tab: Tab) {
+        if panel.isVisible && tab == .calendar { weather.refresh(); events.refresh() }
         if panel.isVisible && tab == .music { nowPlaying.startPolling() }
         else { nowPlaying.stopPolling() }
         if panel.isVisible && tab == .sound { sound.refresh(); bluetooth.refresh() }
@@ -2319,6 +2898,7 @@ final class PanelController {
         if panel.isVisible && tab == .unifi { unifi.startPolling() } else { unifi.stopPolling() }
         if panel.isVisible && tab == .vpn { vpn.startPolling() } else { vpn.stopPolling() }
         if panel.isVisible && tab == .home { ha.startPolling() } else { ha.stopPolling() }
+        if panel.isVisible && tab == .pi { pi.startPolling() } else { pi.stopPolling() }
         if panel.isVisible && tab == .ai { ai.startPolling() } else { ai.stopPolling() }
     }
 
@@ -2388,6 +2968,7 @@ final class PanelController {
         unifi.stopPolling()
         vpn.stopPolling()
         ha.stopPolling()
+        pi.stopPolling()
     }
 
     private func topRightOrigin() -> NSPoint {
