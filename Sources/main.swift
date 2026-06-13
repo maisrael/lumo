@@ -148,20 +148,66 @@ struct CalendarTab: View {
     private var today: String {
         let f = DateFormatter()
         f.dateFormat = "EEEE, d MMMM"
+        f.timeZone = TimeZone(identifier: "Europe/Helsinki")
         return f.string(from: Date())
     }
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 16) {
             Text(today)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Gruv.fg0)
-            Text("Today")
-                .font(.callout.weight(.medium))
-                .foregroundStyle(Gruv.yellow)
-                .padding(.top, 4)
-            placeholderRow("No events loaded yet")
-            placeholderRow("Calendar data comes in v2")
+            WorldClocksView()
         }
+    }
+}
+
+struct WorldClocksView: View {
+    private struct City { let name: String; let tz: TimeZone }
+    private let home = TimeZone(identifier: "Europe/Helsinki")!
+    private var cities: [City] {
+        [City(name: "Helsinki",     tz: TimeZone(identifier: "Europe/Helsinki")!),
+         City(name: "Kuala Lumpur", tz: TimeZone(identifier: "Asia/Kuala_Lumpur")!),
+         City(name: "Málaga",       tz: TimeZone(identifier: "Europe/Madrid")!)]
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: Date(), by: 1)) { ctx in
+            VStack(spacing: 14) {
+                ForEach(cities, id: \.name) { row($0, now: ctx.date) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ city: City, now: Date) -> some View {
+        let isHome = city.tz.identifier == home.identifier
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(city.name)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(Gruv.fg1)
+                Text(subtitle(city, now: now))
+                    .font(.caption2)
+                    .foregroundStyle(isHome ? Gruv.aqua : Gruv.gray)
+            }
+            Spacer()
+            Text(timeString(city.tz, now))
+                .font(.system(.title2, design: .rounded).weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(isHome ? Gruv.fg0 : Gruv.fg1)
+        }
+    }
+
+    private func timeString(_ tz: TimeZone, _ now: Date) -> String {
+        let f = DateFormatter(); f.timeZone = tz; f.dateFormat = "HH:mm"
+        return f.string(from: now)
+    }
+
+    private func subtitle(_ city: City, now: Date) -> String {
+        if city.tz.identifier == home.identifier { return "home" }
+        let diff = (city.tz.secondsFromGMT(for: now) - home.secondsFromGMT(for: now)) / 3600
+        let dayF = DateFormatter(); dayF.timeZone = city.tz; dayF.dateFormat = "EEE"
+        return "\(dayF.string(from: now)) · \(diff >= 0 ? "+" : "")\(diff)h"
     }
 }
 
