@@ -40,7 +40,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, network, unifi, system
+    case calendar, timer, music, sound, power, network, unifi, vpn, system
 
     var id: String { rawValue }
 
@@ -53,6 +53,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .power:    return "Power"
         case .network:  return "Network"
         case .unifi:    return "UniFi"
+        case .vpn:      return "VPN"
         case .system:   return "System"
         }
     }
@@ -66,6 +67,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .power:    return "bolt.fill"
         case .network:  return "wifi"
         case .unifi:    return "shield.lefthalf.filled"
+        case .vpn:      return "lock.fill"
         case .system:   return "slider.horizontal.3"
         }
     }
@@ -89,6 +91,14 @@ enum AppLauncher {
         if let url = URL(string: urlString) { NSWorkspace.shared.open(url) }
         NotificationCenter.default.post(name: .lumoDismiss, object: nil)
     }
+
+    static func openApp(named name: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-a", name]
+        try? p.run()
+        NotificationCenter.default.post(name: .lumoDismiss, object: nil)
+    }
 }
 
 // MARK: - Shared state
@@ -108,6 +118,7 @@ struct PanelView: View {
     @ObservedObject var power: PowerModel
     @ObservedObject var network: NetworkModel
     @ObservedObject var unifi: UniFiModel
+    @ObservedObject var vpn: VPNModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -120,13 +131,13 @@ struct PanelView: View {
     }
 
     private var rail: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 9) {
             ForEach(Tab.allCases) { t in
                 RailIcon(tab: t, isActive: state.tab == t) { state.tab = t }
             }
             Spacer()
         }
-        .padding(.vertical, 16)
+        .padding(.vertical, 14)
         .padding(.horizontal, 9)
         .frame(width: 60)
     }
@@ -149,6 +160,7 @@ struct PanelView: View {
                 case .power:    PowerTab(model: power)
                 case .network:  NetworkTab(model: network)
                 case .unifi:    UniFiTab(model: unifi)
+                case .vpn:      VPNTab(model: vpn)
                 case .system:   SystemTab()
                 }
             }
@@ -1673,6 +1685,113 @@ struct UniFiTab: View {
     }
 }
 
+// MARK: - VPN (Twingate / OpenVPN / NordVPN — detect via utun + process)
+
+struct VPNEntry: Identifiable {
+    let id: String
+    let name: String
+    let app: String
+    var active: Bool
+    var ip: String
+}
+
+final class VPNModel: ObservableObject {
+    @Published var twingate = VPNEntry(id: "tg", name: "Twingate", app: "Twingate", active: false, ip: "")
+    @Published var openvpn  = VPNEntry(id: "ov", name: "OpenVPN", app: "OpenVPN Connect", active: false, ip: "")
+    @Published var nordvpn  = VPNEntry(id: "nd", name: "NordVPN", app: "NordVPN", active: false, ip: "")
+
+    private var timer: Timer?
+    var entries: [VPNEntry] { [twingate, openvpn, nordvpn] }
+    var anyActive: Bool { twingate.active || openvpn.active || nordvpn.active }
+
+    func startPolling() {
+        stopPolling(); refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+    func stopPolling() { timer?.invalidate(); timer = nil }
+
+    func refresh() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var tg = false, ov = false, nd = false, tgip = "", ovip = "", ndip = ""
+            for ip in self.utunIPv4s() {
+                if ip.hasPrefix("10.15.10.") || ip.hasPrefix("169.254.") { continue }  // Sidecar / link-local
+                let o = ip.split(separator: ".").compactMap { Int($0) }
+                if o.count == 4 && o[0] == 100 && o[1] >= 64 && o[1] <= 127 { tg = true; tgip = ip }   // CGNAT 100.64/10
+                else if ip.hasPrefix("10.5.0.") { nd = true; ndip = ip }                              // NordLynx
+                else { ov = true; ovip = ip }                                                         // OpenVPN
+            }
+            if tg && !self.processRunning("Twingate") { tg = false; tgip = "" }
+            if ov && !self.processRunning("ovpnagent") { ov = false; ovip = "" }
+            DispatchQueue.main.async {
+                self.twingate.active = tg; self.twingate.ip = tgip
+                self.openvpn.active = ov;  self.openvpn.ip = ovip
+                self.nordvpn.active = nd;  self.nordvpn.ip = ndip
+            }
+        }
+    }
+
+    private func utunIPv4s() -> [String] {
+        var ips: [String] = []
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return ips }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        while let cur = ptr {
+            let name = String(cString: cur.pointee.ifa_name)
+            if name.hasPrefix("utun"), let sa = cur.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    ips.append(String(cString: host))
+                }
+            }
+            ptr = cur.pointee.ifa_next
+        }
+        return ips
+    }
+
+    private func processRunning(_ name: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-x", name]
+        p.standardOutput = Pipe(); p.standardError = Pipe()
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+}
+
+struct VPNTab: View {
+    @ObservedObject var model: VPNModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(model.entries) { vpn in
+                Button { AppLauncher.openApp(named: vpn.app) } label: {
+                    HStack(spacing: 11) {
+                        Image(systemName: vpn.active ? "lock.fill" : "lock.open")
+                            .font(.system(size: 16)).frame(width: 22)
+                            .foregroundStyle(vpn.active ? Gruv.green : Gruv.fg4)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(vpn.name).foregroundStyle(Gruv.fg1)
+                            Text(vpn.active ? "Connected · \(vpn.ip)" : "Off")
+                                .font(.caption)
+                                .foregroundStyle(vpn.active ? Gruv.green : Gruv.gray)
+                        }
+                        Spacer()
+                        Image(systemName: "arrow.up.forward.app").font(.caption).foregroundStyle(Gruv.fg4)
+                    }
+                    .padding(.vertical, 9).padding(.horizontal, 10)
+                    .background(RoundedRectangle(cornerRadius: 10)
+                        .fill(vpn.active ? Gruv.green.opacity(0.12) : Gruv.bg1.opacity(0.5)))
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -1690,6 +1809,7 @@ final class PanelController {
     let power = PowerModel()
     let network = NetworkModel()
     let unifi = UniFiModel()
+    let vpn = VPNModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -1707,7 +1827,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -1743,6 +1863,7 @@ final class PanelController {
         if panel.isVisible && tab == .power { power.startPolling() } else { power.stopPolling() }
         if panel.isVisible && tab == .network { network.refresh(); network.scan() }
         if panel.isVisible && tab == .unifi { unifi.startPolling() } else { unifi.stopPolling() }
+        if panel.isVisible && tab == .vpn { vpn.startPolling() } else { vpn.stopPolling() }
     }
 
     func toggle(tab: Tab) {
