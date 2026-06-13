@@ -3,6 +3,7 @@ import SwiftUI
 import Combine
 import CoreAudio
 import CoreBluetooth
+import IOBluetooth
 
 // MARK: - Gruvbox palette
 
@@ -71,6 +72,11 @@ enum AppLauncher {
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         }
+        NotificationCenter.default.post(name: .lumoDismiss, object: nil)
+    }
+
+    static func openURL(_ urlString: String) {
+        if let url = URL(string: urlString) { NSWorkspace.shared.open(url) }
         NotificationCenter.default.post(name: .lumoDismiss, object: nil)
     }
 }
@@ -803,16 +809,20 @@ final class BluetoothModel: ObservableObject {
     @Published var busy: Set<String> = []
 
     private let tool = "/opt/homebrew/bin/blueutil"
-    // Paired non-audio peripherals to hide from the audio list.
-    private let excluded = ["keyboard", "mouse", "trackpad", "controller", "gamepad"]
 
     func refresh() {
-        guard FileManager.default.isExecutableFile(atPath: tool) else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let out = self.run([self.tool, "--paired"]) ?? ""
-            let parsed = self.parse(out)
-            DispatchQueue.main.async { self.devices = parsed }
+            var found: [BTDevice] = []
+            if let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] {
+                // 0x04 = Audio major class → AirPods, headphones, speakers only.
+                for d in paired where d.deviceClassMajor == 0x04 {
+                    let addr = (d.addressString ?? "").lowercased()
+                    guard !addr.isEmpty else { continue }
+                    found.append(BTDevice(id: addr, name: d.name ?? addr, connected: d.isConnected()))
+                }
+            }
+            DispatchQueue.main.async { self.devices = found }
         }
     }
 
@@ -832,18 +842,6 @@ final class BluetoothModel: ObservableObject {
                     self.devices[i].connected = on
                 }
             }
-        }
-    }
-
-    private func parse(_ out: String) -> [BTDevice] {
-        out.split(separator: "\n").compactMap { sub in
-            let line = String(sub)
-            guard let aStart = line.range(of: "address: "),
-                  let nStart = line.range(of: "name: \"") else { return nil }
-            let addr = String(line[aStart.upperBound...].prefix { $0 != "," })
-            let name = String(line[nStart.upperBound...].prefix { $0 != "\"" })
-            guard !excluded.contains(where: { name.lowercased().contains($0) }) else { return nil }
-            return BTDevice(id: addr, name: name, connected: line.contains(", connected"))
         }
     }
 
@@ -883,9 +881,21 @@ struct SoundTab: View {
         Group {
             if !bt.devices.isEmpty {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Bluetooth")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Gruv.yellow)
+                    HStack {
+                        Text("Bluetooth")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Gruv.yellow)
+                        Spacer()
+                        Button {
+                            AppLauncher.openURL("x-apple.systempreferences:com.apple.BluetoothSettings")
+                        } label: {
+                            Image(systemName: "gearshape")
+                                .font(.caption)
+                                .foregroundStyle(Gruv.fg4)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Bluetooth Settings")
+                    }
                     ForEach(bt.devices) { d in
                         Button { bt.toggle(d) } label: {
                             HStack(spacing: 9) {
