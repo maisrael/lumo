@@ -81,6 +81,7 @@ final class PanelState: ObservableObject {
 struct PanelView: View {
     @ObservedObject var state: PanelState
     @ObservedObject var timer: TimerModel
+    @ObservedObject var nowPlaying: NowPlayingModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -117,7 +118,7 @@ struct PanelView: View {
                 switch state.tab {
                 case .calendar: CalendarTab()
                 case .timer:    TimerView(model: timer)
-                case .music:    MusicTab()
+                case .music:    MusicTab(model: nowPlaying)
                 case .system:   SystemTab()
                 }
             }
@@ -285,20 +286,166 @@ struct WorldClocksView: View {
     }
 }
 
-struct MusicTab: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.secondary.opacity(0.18))
-                .frame(height: 120)
-                .overlay(Image(systemName: "music.note").font(.largeTitle).foregroundStyle(.secondary))
-            Text("Nothing playing")
-                .font(.headline)
-                .foregroundStyle(Gruv.fg1)
-            Text("Now-playing data comes in v2")
-                .font(.callout)
-                .foregroundStyle(Gruv.gray)
+// MARK: - Now Playing (Spotify via AppleScript)
+
+final class NowPlayingModel: ObservableObject {
+    @Published var title = ""
+    @Published var artist = ""
+    @Published var album = ""
+    @Published var artwork: NSImage?
+    @Published var isPlaying = false
+    @Published var hasTrack = false
+    @Published var progress: Double = 0   // 0...1
+
+    private var timer: Timer?
+    private var artURL: String?
+
+    private let infoScript = """
+    set out to ""
+    if application "Spotify" is running then
+    \ttell application "Spotify"
+    \t\tset ps to player state as string
+    \t\tif ps is not "stopped" then
+    \t\t\tset out to ps & linefeed & (name of current track) & linefeed & (artist of current track) & linefeed & (album of current track) & linefeed & (artwork url of current track) & linefeed & ((duration of current track) as text) & linefeed & ((player position) as text)
+    \t\tend if
+    \tend tell
+    end if
+    return out
+    """
+
+    func startPolling() {
+        stopPolling()
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    func stopPolling() { timer?.invalidate(); timer = nil }
+
+    func refresh() {
+        let script = infoScript
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let out = NowPlayingModel.runOSA(script) ?? ""
+            let lines = out.components(separatedBy: "\n")
+            DispatchQueue.main.async { self?.apply(lines) }
         }
+    }
+
+    private func apply(_ lines: [String]) {
+        guard lines.count >= 7, !lines[0].isEmpty else {
+            hasTrack = false; isPlaying = false
+            title = ""; artist = ""; album = ""; artwork = nil; artURL = nil; progress = 0
+            return
+        }
+        hasTrack = true
+        isPlaying = lines[0] == "playing"
+        title = lines[1]; artist = lines[2]; album = lines[3]
+        let durMs = Double(lines[5]) ?? 0
+        let pos = Double(lines[6].replacingOccurrences(of: ",", with: ".")) ?? 0
+        progress = durMs > 0 ? min(1, max(0, pos / (durMs / 1000))) : 0
+        if lines[4] != artURL { artURL = lines[4]; loadArtwork(lines[4]) }
+    }
+
+    private func loadArtwork(_ urlStr: String) {
+        guard let url = URL(string: urlStr) else { artwork = nil; return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            let img = data.flatMap { NSImage(data: $0) }
+            DispatchQueue.main.async { self?.artwork = img }
+        }.resume()
+    }
+
+    func playPause() { control("playpause") }
+    func next()      { control("next track") }
+    func previous()  { control("previous track") }
+
+    private func control(_ cmd: String) {
+        let script = "if application \"Spotify\" is running then tell application \"Spotify\" to \(cmd)"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            _ = NowPlayingModel.runOSA(script)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self?.refresh() }
+        }
+    }
+
+    private static func runOSA(_ script: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+struct MusicTab: View {
+    @ObservedObject var model: NowPlayingModel
+
+    var body: some View {
+        if model.hasTrack {
+            VStack(spacing: 14) {
+                artwork
+                VStack(spacing: 3) {
+                    Text(model.title).font(.headline).foregroundStyle(Gruv.fg0).lineLimit(1)
+                    Text(model.artist).font(.callout).foregroundStyle(Gruv.fg2).lineLimit(1)
+                    Text(model.album).font(.caption).foregroundStyle(Gruv.gray).lineLimit(1)
+                }
+                progressBar
+                controls
+                Spacer()
+            }
+        } else {
+            VStack(spacing: 14) {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Gruv.bg1.opacity(0.6))
+                    .frame(height: 150)
+                    .overlay(Image(systemName: "music.note").font(.largeTitle).foregroundStyle(Gruv.gray))
+                Text("Nothing playing").font(.headline).foregroundStyle(Gruv.fg2)
+                Text("Start Spotify and hit play").font(.callout).foregroundStyle(Gruv.gray)
+                Spacer()
+            }
+        }
+    }
+
+    private var artwork: some View {
+        Group {
+            if let art = model.artwork {
+                Image(nsImage: art).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Gruv.bg1.opacity(0.6)
+                    .overlay(Image(systemName: "music.note").font(.largeTitle).foregroundStyle(Gruv.gray))
+            }
+        }
+        .frame(width: 168, height: 168)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var progressBar: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Gruv.bg3.opacity(0.5))
+                Capsule().fill(Gruv.green).frame(width: geo.size.width * model.progress)
+            }
+        }
+        .frame(height: 4)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 30) {
+            ctrl("backward.fill") { model.previous() }
+            ctrl(model.isPlaying ? "pause.fill" : "play.fill", size: 30) { model.playPause() }
+            ctrl("forward.fill") { model.next() }
+        }
+        .padding(.top, 4)
+    }
+
+    private func ctrl(_ symbol: String, size: CGFloat = 20, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: size))
+                .foregroundStyle(Gruv.fg1)
+                .frame(width: 44, height: 44)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -452,9 +599,11 @@ final class FloatingPanel: NSPanel {
 final class PanelController {
     let state = PanelState()
     let timer = TimerModel()
+    let nowPlaying = NowPlayingModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
+    private var cancellables = Set<AnyCancellable>()
     private let size = NSSize(width: 380, height: 500)
 
     init() {
@@ -468,7 +617,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -489,6 +638,17 @@ final class PanelController {
         NotificationCenter.default.addObserver(forName: .lumoDismiss, object: nil, queue: .main) { [weak self] _ in
             self?.hide()
         }
+
+        // Poll now-playing only while the Music tab is open.
+        state.$tab
+            .receive(on: RunLoop.main)
+            .sink { [weak self] tab in self?.updatePolling(forTab: tab) }
+            .store(in: &cancellables)
+    }
+
+    private func updatePolling(forTab tab: Tab) {
+        if panel.isVisible && tab == .music { nowPlaying.startPolling() }
+        else { nowPlaying.stopPolling() }
     }
 
     func toggle(tab: Tab) {
@@ -513,10 +673,12 @@ final class PanelController {
             panel.animator().setFrameOrigin(final)
         }
         installMonitors()
+        updatePolling(forTab: state.tab)
     }
 
     private func hide() {
         removeMonitors()
+        nowPlaying.stopPolling()
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.11
             panel.animator().alphaValue = 0
