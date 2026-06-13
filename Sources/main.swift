@@ -2,6 +2,32 @@ import AppKit
 import SwiftUI
 import Combine
 
+// MARK: - Gruvbox palette
+
+enum Gruv {
+    static let bg0    = Color(hex: 0x282828)
+    static let bg1    = Color(hex: 0x3c3836)
+    static let bg3    = Color(hex: 0x665c54)
+    static let fg0    = Color(hex: 0xfbf1c7)
+    static let fg1    = Color(hex: 0xebdbb2)
+    static let fg4    = Color(hex: 0xa89984)
+    static let gray   = Color(hex: 0x928374)
+    static let blue   = Color(hex: 0x83a598)
+    static let aqua   = Color(hex: 0x8ec07c)
+    static let green  = Color(hex: 0xb8bb26)
+    static let yellow = Color(hex: 0xfabd2f)
+}
+
+extension Color {
+    init(hex: UInt32) {
+        self.init(.sRGB,
+                  red:   Double((hex >> 16) & 0xff) / 255,
+                  green: Double((hex >> 8) & 0xff) / 255,
+                  blue:  Double(hex & 0xff) / 255,
+                  opacity: 1)
+    }
+}
+
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
@@ -40,29 +66,17 @@ struct PanelView: View {
     var body: some View {
         HStack(spacing: 0) {
             rail
-            Divider().opacity(0.25)
+            Rectangle().fill(Gruv.bg3.opacity(0.4)).frame(width: 1)
             content
         }
         .frame(width: 380, height: 440)
+        .background(Gruv.bg0.opacity(0.72))
     }
 
     private var rail: some View {
         VStack(spacing: 12) {
             ForEach(Tab.allCases) { t in
-                Button {
-                    state.tab = t
-                } label: {
-                    Image(systemName: t.symbol)
-                        .font(.system(size: 16, weight: .medium))
-                        .frame(width: 42, height: 42)
-                        .background(
-                            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                .fill(state.tab == t ? Color.accentColor.opacity(0.28) : .clear)
-                        )
-                        .foregroundStyle(state.tab == t ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .help(t.title)
+                RailIcon(tab: t, isActive: state.tab == t) { state.tab = t }
             }
             Spacer()
         }
@@ -75,6 +89,7 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             Text(state.tab.title)
                 .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Gruv.fg1)
                 .padding(.horizontal, 18)
                 .padding(.top, 18)
                 .padding(.bottom, 12)
@@ -94,14 +109,56 @@ struct PanelView: View {
     }
 }
 
-// MARK: - Placeholder tab bodies (real data wired in later)
+// MARK: - Rail icon with hover state
+
+struct RailIcon: View {
+    let tab: Tab
+    let isActive: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: tab.symbol)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: 42, height: 42)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(fill)
+                )
+                .foregroundStyle(isActive ? Gruv.aqua : Gruv.fg4)
+        }
+        .buttonStyle(.plain)
+        .help(tab.title)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .animation(.easeOut(duration: 0.12), value: isActive)
+    }
+
+    private var fill: Color {
+        if isActive { return Gruv.aqua.opacity(0.20) }
+        if hovering { return Gruv.fg4.opacity(0.14) }
+        return .clear
+    }
+}
+
+// MARK: - Tab bodies
 
 struct CalendarTab: View {
+    private var today: String {
+        let f = DateFormatter()
+        f.dateFormat = "EEEE, d MMMM"
+        return f.string(from: Date())
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Text(today)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(Gruv.fg0)
             Text("Today")
                 .font(.callout.weight(.medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Gruv.yellow)
+                .padding(.top, 4)
             placeholderRow("No events loaded yet")
             placeholderRow("Calendar data comes in v2")
         }
@@ -117,9 +174,10 @@ struct MusicTab: View {
                 .overlay(Image(systemName: "music.note").font(.largeTitle).foregroundStyle(.secondary))
             Text("Nothing playing")
                 .font(.headline)
+                .foregroundStyle(Gruv.fg1)
             Text("Now-playing data comes in v2")
                 .font(.callout)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Gruv.gray)
         }
     }
 }
@@ -133,15 +191,17 @@ struct SystemTab: View {
             Toggle("Do Not Disturb", isOn: $dnd)
             Spacer()
         }
+        .font(.callout)
+        .foregroundStyle(Gruv.fg1)
         .toggleStyle(.switch)
-        .tint(.accentColor)
+        .tint(Gruv.green)
     }
 }
 
 private func placeholderRow(_ text: String) -> some View {
     HStack {
-        Circle().fill(.secondary.opacity(0.4)).frame(width: 6, height: 6)
-        Text(text).font(.callout).foregroundStyle(.tertiary)
+        Circle().fill(Gruv.gray.opacity(0.6)).frame(width: 6, height: 6)
+        Text(text).font(.callout).foregroundStyle(Gruv.gray)
     }
 }
 
@@ -200,12 +260,16 @@ final class PanelController {
     }
 
     private func show() {
-        positionTopRight()
+        let final = topRightOrigin()
+        // Start a touch higher + transparent, then slide down into place.
+        panel.setFrameOrigin(NSPoint(x: final.x, y: final.y + 10))
         panel.alphaValue = 0
         panel.makeKeyAndOrderFront(nil)
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.14
+            ctx.duration = 0.16
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
+            panel.animator().setFrameOrigin(final)
         }
         installMonitors()
     }
@@ -220,12 +284,12 @@ final class PanelController {
         })
     }
 
-    private func positionTopRight() {
-        guard let screen = NSScreen.main else { return }
+    private func topRightOrigin() -> NSPoint {
+        guard let screen = NSScreen.main else { return .zero }
         let vf = screen.visibleFrame
         let gap: CGFloat = 8
-        panel.setFrameOrigin(NSPoint(x: vf.maxX - size.width - gap,
-                                     y: vf.maxY - size.height - gap))
+        return NSPoint(x: vf.midX - size.width / 2,
+                       y: vf.maxY - size.height - gap)
     }
 
     private func installMonitors() {
