@@ -10,6 +10,7 @@ enum Gruv {
     static let bg3    = Color(hex: 0x665c54)
     static let fg0    = Color(hex: 0xfbf1c7)
     static let fg1    = Color(hex: 0xebdbb2)
+    static let fg2    = Color(hex: 0xd5c4a1)
     static let fg4    = Color(hex: 0xa89984)
     static let gray   = Color(hex: 0x928374)
     static let blue   = Color(hex: 0x83a598)
@@ -31,13 +32,14 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, music, system
+    case calendar, timer, music, system
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .calendar: return "Calendar"
+        case .timer:    return "Timer"
         case .music:    return "Now Playing"
         case .system:   return "System"
         }
@@ -46,9 +48,25 @@ enum Tab: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .calendar: return "calendar"
+        case .timer:    return "timer"
         case .music:    return "music.note"
         case .system:   return "slider.horizontal.3"
         }
+    }
+}
+
+// MARK: - Launch another app + dismiss the panel
+
+extension Notification.Name {
+    static let lumoDismiss = Notification.Name("fi.mangusti.lumo.dismiss")
+}
+
+enum AppLauncher {
+    static func open(_ bundleID: String) {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
+        NotificationCenter.default.post(name: .lumoDismiss, object: nil)
     }
 }
 
@@ -62,6 +80,7 @@ final class PanelState: ObservableObject {
 
 struct PanelView: View {
     @ObservedObject var state: PanelState
+    @ObservedObject var timer: TimerModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -69,7 +88,7 @@ struct PanelView: View {
             Rectangle().fill(Gruv.bg3.opacity(0.4)).frame(width: 1)
             content
         }
-        .frame(width: 380, height: 440)
+        .frame(width: 380, height: 500)
         .background(Gruv.bg0.opacity(0.72))
     }
 
@@ -97,6 +116,7 @@ struct PanelView: View {
             Group {
                 switch state.tab {
                 case .calendar: CalendarTab()
+                case .timer:    TimerView(model: timer)
                 case .music:    MusicTab()
                 case .system:   SystemTab()
                 }
@@ -157,7 +177,59 @@ struct CalendarTab: View {
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Gruv.fg0)
             WorldClocksView()
+            Rectangle().fill(Gruv.bg3.opacity(0.45)).frame(height: 1)
+            MiniCalendar()
         }
+    }
+}
+
+// MARK: - Mini month calendar (tap → Calendar.app)
+
+struct MiniCalendar: View {
+    private var cal: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.firstWeekday = 2 // Monday
+        c.timeZone = TimeZone(identifier: "Europe/Helsinki")!
+        return c
+    }
+    private let weekdays = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+    private var cols: [GridItem] { Array(repeating: GridItem(.flexible(), spacing: 2), count: 7) }
+
+    var body: some View {
+        let now = Date()
+        let first = cal.date(from: cal.dateComponents([.year, .month], from: now))!
+        let daysInMonth = cal.range(of: .day, in: .month, for: first)!.count
+        let leading = (cal.component(.weekday, from: first) - cal.firstWeekday + 7) % 7
+        let today = cal.component(.day, from: now)
+
+        VStack(alignment: .leading, spacing: 6) {
+            Text(monthLabel(first))
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(Gruv.fg1)
+            LazyVGrid(columns: cols, spacing: 3) {
+                ForEach(weekdays, id: \.self) { d in
+                    Text(d).font(.caption2).foregroundStyle(Gruv.gray).frame(maxWidth: .infinity)
+                }
+                ForEach(0..<leading, id: \.self) { _ in Color.clear.frame(height: 24) }
+                ForEach(1...daysInMonth, id: \.self) { day in
+                    Text("\(day)")
+                        .font(.caption).monospacedDigit()
+                        .frame(maxWidth: .infinity, minHeight: 24)
+                        .foregroundStyle(day == today ? Gruv.bg0 : Gruv.fg2)
+                        .background(
+                            Circle().fill(day == today ? Gruv.yellow : .clear)
+                                .frame(width: 24, height: 24)
+                        )
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { AppLauncher.open("com.apple.iCal") }
+    }
+
+    private func monthLabel(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; f.timeZone = cal.timeZone
+        return f.string(from: d)
     }
 }
 
@@ -196,6 +268,8 @@ struct WorldClocksView: View {
                 .monospacedDigit()
                 .foregroundStyle(isHome ? Gruv.fg0 : Gruv.fg1)
         }
+        .contentShape(Rectangle())
+        .onTapGesture { AppLauncher.open("com.apple.clock") }
     }
 
     private func timeString(_ tz: TimeZone, _ now: Date) -> String {
@@ -251,6 +325,122 @@ private func placeholderRow(_ text: String) -> some View {
     }
 }
 
+// MARK: - Timer (custom duration, remembered across launches)
+
+final class TimerModel: ObservableObject {
+    @Published private(set) var totalSeconds: Int
+    @Published private(set) var remaining: Int
+    @Published private(set) var running = false
+
+    private var ticker: Timer?
+    private static let key = "timerSeconds"
+
+    init() {
+        let saved = UserDefaults.standard.integer(forKey: Self.key)
+        let total = saved > 0 ? saved : 25 * 60   // default 25 min (pomodoro)
+        totalSeconds = total
+        remaining = total
+    }
+
+    var isPristine: Bool { !running && remaining == totalSeconds }
+
+    func adjust(minutes delta: Int) {
+        let m = max(1, min(180, totalSeconds / 60 + delta))
+        totalSeconds = m * 60
+        UserDefaults.standard.set(totalSeconds, forKey: Self.key)
+        if !running { remaining = totalSeconds }
+    }
+
+    func startOrPause() { running ? pause() : start() }
+
+    func start() {
+        guard !running else { return }
+        if remaining <= 0 { remaining = totalSeconds }
+        running = true
+        ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    func pause() {
+        running = false
+        ticker?.invalidate(); ticker = nil
+    }
+
+    func reset() { pause(); remaining = totalSeconds }
+
+    private func tick() {
+        guard remaining > 1 else { finish(); return }
+        remaining -= 1
+    }
+
+    private func finish() {
+        pause()
+        remaining = 0
+        NSSound(named: "Glass")?.play()
+    }
+}
+
+struct TimerView: View {
+    @ObservedObject var model: TimerModel
+
+    private var shown: Int { model.isPristine ? model.totalSeconds : model.remaining }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Text(format(shown))
+                .font(.system(size: 52, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(model.remaining == 0 ? Gruv.yellow : Gruv.fg0)
+                .padding(.top, 6)
+
+            HStack(spacing: 8) {
+                stepButton("−5") { model.adjust(minutes: -5) }
+                stepButton("−1") { model.adjust(minutes: -1) }
+                stepButton("+1") { model.adjust(minutes: +1) }
+                stepButton("+5") { model.adjust(minutes: +5) }
+            }
+            .disabled(model.running)
+            .opacity(model.running ? 0.4 : 1)
+
+            HStack(spacing: 10) {
+                Button(action: model.startOrPause) {
+                    Text(model.running ? "Pause" : "Start")
+                        .frame(maxWidth: .infinity).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 9).fill(Gruv.green.opacity(0.85)))
+                        .foregroundStyle(Gruv.bg0)
+                }
+                Button(action: model.reset) {
+                    Text("Reset")
+                        .frame(maxWidth: .infinity).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 9).fill(Gruv.bg3.opacity(0.6)))
+                        .foregroundStyle(Gruv.fg1)
+                }
+            }
+            .font(.callout.weight(.medium))
+            .buttonStyle(.plain)
+            Spacer()
+        }
+    }
+
+    private func stepButton(_ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.callout.weight(.semibold)).monospacedDigit()
+                .frame(maxWidth: .infinity).padding(.vertical, 7)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Gruv.bg1.opacity(0.8)))
+                .foregroundStyle(Gruv.fg1)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func format(_ s: Int) -> String {
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec)
+                     : String(format: "%02d:%02d", m, sec)
+    }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -261,10 +451,11 @@ final class FloatingPanel: NSPanel {
 
 final class PanelController {
     let state = PanelState()
+    let timer = TimerModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
-    private let size = NSSize(width: 380, height: 440)
+    private let size = NSSize(width: 380, height: 500)
 
     init() {
         let visual = NSVisualEffectView()
@@ -277,7 +468,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -294,6 +485,10 @@ final class PanelController {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.appearance = NSAppearance(named: .darkAqua)
+
+        NotificationCenter.default.addObserver(forName: .lumoDismiss, object: nil, queue: .main) { [weak self] _ in
+            self?.hide()
+        }
     }
 
     func toggle(tab: Tab) {
