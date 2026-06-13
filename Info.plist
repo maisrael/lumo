@@ -22,6 +22,8 @@
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>Lumo reads and controls Spotify playback to show Now Playing.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Lumo lists and connects your paired Bluetooth audio devices.</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>

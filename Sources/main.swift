@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 import CoreAudio
+import CoreBluetooth
 
 // MARK: - Gruvbox palette
 
@@ -87,6 +88,7 @@ struct PanelView: View {
     @ObservedObject var timer: TimerModel
     @ObservedObject var nowPlaying: NowPlayingModel
     @ObservedObject var sound: SoundModel
+    @ObservedObject var bluetooth: BluetoothModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -124,7 +126,7 @@ struct PanelView: View {
                 case .calendar: CalendarTab()
                 case .timer:    TimerView(model: timer)
                 case .music:    MusicTab(model: nowPlaying)
-                case .sound:    SoundTab(model: sound)
+                case .sound:    SoundTab(model: sound, bt: bluetooth)
                 case .system:   SystemTab()
                 }
             }
@@ -788,8 +790,78 @@ final class SoundModel: ObservableObject {
     }
 }
 
+// MARK: - Bluetooth (paired audio devices via blueutil)
+
+struct BTDevice: Identifiable, Equatable {
+    let id: String   // MAC address
+    let name: String
+    var connected: Bool
+}
+
+final class BluetoothModel: ObservableObject {
+    @Published var devices: [BTDevice] = []
+    @Published var busy: Set<String> = []
+
+    private let tool = "/opt/homebrew/bin/blueutil"
+    // Paired non-audio peripherals to hide from the audio list.
+    private let excluded = ["keyboard", "mouse", "trackpad", "controller", "gamepad"]
+
+    func refresh() {
+        guard FileManager.default.isExecutableFile(atPath: tool) else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let out = self.run([self.tool, "--paired"]) ?? ""
+            let parsed = self.parse(out)
+            DispatchQueue.main.async { self.devices = parsed }
+        }
+    }
+
+    func toggle(_ d: BTDevice) {
+        guard !busy.contains(d.id) else { return }
+        busy.insert(d.id)
+        let flag = d.connected ? "--disconnect" : "--connect"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            _ = self.run([self.tool, flag, d.id])
+            Thread.sleep(forTimeInterval: d.connected ? 1.0 : 2.5)
+            let on = (self.run([self.tool, "--is-connected", d.id]) ?? "0")
+                .trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+            DispatchQueue.main.async {
+                self.busy.remove(d.id)
+                if let i = self.devices.firstIndex(where: { $0.id == d.id }) {
+                    self.devices[i].connected = on
+                }
+            }
+        }
+    }
+
+    private func parse(_ out: String) -> [BTDevice] {
+        out.split(separator: "\n").compactMap { sub in
+            let line = String(sub)
+            guard let aStart = line.range(of: "address: "),
+                  let nStart = line.range(of: "name: \"") else { return nil }
+            let addr = String(line[aStart.upperBound...].prefix { $0 != "," })
+            let name = String(line[nStart.upperBound...].prefix { $0 != "\"" })
+            guard !excluded.contains(where: { name.lowercased().contains($0) }) else { return nil }
+            return BTDevice(id: addr, name: name, connected: line.contains(", connected"))
+        }
+    }
+
+    private func run(_ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: args[0])
+        p.arguments = Array(args.dropFirst())
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 struct SoundTab: View {
     @ObservedObject var model: SoundModel
+    @ObservedObject var bt: BluetoothModel
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -801,8 +873,44 @@ struct SoundTab: View {
                 deviceSection("Input", devices: model.inputs, selected: model.defaultInput) {
                     model.selectInput($0)
                 }
+                bluetoothSection
             }
             .padding(.bottom, 8)
+        }
+    }
+
+    private var bluetoothSection: some View {
+        Group {
+            if !bt.devices.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Bluetooth")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Gruv.yellow)
+                    ForEach(bt.devices) { d in
+                        Button { bt.toggle(d) } label: {
+                            HStack(spacing: 9) {
+                                Image(systemName: icon(for: d.name))
+                                    .frame(width: 18)
+                                    .foregroundStyle(d.connected ? Gruv.aqua : Gruv.fg4)
+                                Text(d.name).foregroundStyle(Gruv.fg1).lineLimit(1)
+                                Spacer()
+                                if bt.busy.contains(d.id) {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Text(d.connected ? "Connected" : "Connect")
+                                        .font(.caption)
+                                        .foregroundStyle(d.connected ? Gruv.green : Gruv.fg4)
+                                }
+                            }
+                            .font(.callout)
+                            .padding(.vertical, 6).padding(.horizontal, 8)
+                            .background(RoundedRectangle(cornerRadius: 8)
+                                .fill(d.connected ? Gruv.bg1.opacity(0.65) : .clear))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
         }
     }
 
@@ -871,6 +979,7 @@ final class PanelController {
     let timer = TimerModel()
     let nowPlaying = NowPlayingModel()
     let sound = SoundModel()
+    let bluetooth = BluetoothModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -888,7 +997,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -920,7 +1029,7 @@ final class PanelController {
     private func updatePolling(forTab tab: Tab) {
         if panel.isVisible && tab == .music { nowPlaying.startPolling() }
         else { nowPlaying.stopPolling() }
-        if panel.isVisible && tab == .sound { sound.refresh() }
+        if panel.isVisible && tab == .sound { sound.refresh(); bluetooth.refresh() }
     }
 
     func toggle(tab: Tab) {
@@ -986,8 +1095,9 @@ final class PanelController {
 
 // MARK: - App delegate (URL scheme entry point)
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelegate {
     let controller = PanelController()
+    private var btManager: CBCentralManager?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
@@ -999,7 +1109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // Instantiating a central manager triggers the Bluetooth permission
+        // prompt, so blueutil (spawned by us) is allowed to enumerate devices.
+        btManager = CBCentralManager(delegate: self, queue: nil)
     }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {}
 
     @objc func handleURLEvent(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
         guard let str = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
