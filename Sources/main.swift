@@ -1345,12 +1345,11 @@ final class NetworkModel: ObservableObject {
         guard !order.isEmpty else { return }
         var names = order.filter { $0 != wifiService }
         if first { names.insert(wifiService, at: 0) } else { names.append(wifiService) }
-        let cmd = "/usr/sbin/networksetup -ordernetworkservices " + names.map { "'\($0)'" }.joined(separator: " ")
-        let script = "do shell script \"\(cmd)\" with administrator privileges"
         working = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            _ = self.sh("/usr/bin/osascript", ["-e", script])
+            // Passwordless via a scoped /etc/sudoers.d rule — no prompt.
+            _ = self.sh("/usr/bin/sudo", ["-n", "/usr/sbin/networksetup", "-ordernetworkservices"] + names)
             DispatchQueue.main.async { self.working = false; self.refresh() }
         }
     }
