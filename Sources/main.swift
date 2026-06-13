@@ -40,7 +40,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, network, unifi, vpn, home, system
+    case calendar, timer, music, sound, power, network, unifi, vpn, home, ai, system
 
     var id: String { rawValue }
 
@@ -55,6 +55,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .unifi:    return "UniFi"
         case .vpn:      return "VPN"
         case .home:     return "Home"
+        case .ai:       return "AI"
         case .system:   return "System"
         }
     }
@@ -70,6 +71,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .unifi:    return "shield.lefthalf.filled"
         case .vpn:      return "lock.fill"
         case .home:     return "house.fill"
+        case .ai:       return "sparkles"
         case .system:   return "slider.horizontal.3"
         }
     }
@@ -122,6 +124,7 @@ struct PanelView: View {
     @ObservedObject var unifi: UniFiModel
     @ObservedObject var vpn: VPNModel
     @ObservedObject var ha: HAModel
+    @ObservedObject var ai: AIModel
     @ObservedObject var system: SystemModel
 
     var body: some View {
@@ -130,7 +133,7 @@ struct PanelView: View {
             Rectangle().fill(Gruv.bg3.opacity(0.4)).frame(width: 1)
             content
         }
-        .frame(width: 380, height: 560)
+        .frame(width: 380, height: 600)
         .background(Gruv.bg0.opacity(0.72))
     }
 
@@ -166,6 +169,7 @@ struct PanelView: View {
                 case .unifi:    UniFiTab(model: unifi)
                 case .vpn:      VPNTab(model: vpn)
                 case .home:     HATab(model: ha)
+                case .ai:       AITab(model: ai)
                 case .system:   SystemTab(model: system)
                 }
             }
@@ -2089,6 +2093,151 @@ struct VPNTab: View {
     }
 }
 
+// MARK: - AI (oMLX status + Claude usage)
+
+final class AIModel: ObservableObject {
+    @Published var omlxRunning = false
+    @Published var omlxModels: [String] = []
+    @Published var tokensToday = 0
+    @Published var messagesToday = 0
+
+    private var omlxKey = ""
+    private var timer: Timer?
+    private var lastClaude = Date.distantPast
+
+    init() {
+        if let data = FileManager.default.contents(atPath: NSHomeDirectory() + "/.omlx/settings.json"),
+           let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let auth = j["auth"] as? [String: Any] {
+            omlxKey = auth["api_key"] as? String ?? ""
+        }
+    }
+
+    func startPolling() {
+        stopPolling()
+        refreshOMLX()
+        computeClaude()
+        timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+            self?.refreshOMLX()
+            self?.computeClaude()
+        }
+    }
+    func stopPolling() { timer?.invalidate(); timer = nil }
+
+    func openDashboard() { AppLauncher.openURL("http://localhost:8000/admin") }
+
+    private func refreshOMLX() {
+        guard let url = URL(string: "http://localhost:8000/v1/models") else { return }
+        var req = URLRequest(url: url, timeoutInterval: 3)
+        if !omlxKey.isEmpty { req.setValue("Bearer \(omlxKey)", forHTTPHeaderField: "Authorization") }
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+            var models: [String] = []
+            if ok, let data,
+               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let arr = j["data"] as? [[String: Any]] {
+                models = arr.compactMap { $0["id"] as? String }
+            }
+            DispatchQueue.main.async { self?.omlxRunning = ok; self?.omlxModels = models }
+        }.resume()
+    }
+
+    // Sum today's Claude Code usage from the live transcripts (throttled).
+    private func computeClaude() {
+        guard Date().timeIntervalSince(lastClaude) > 25 else { return }
+        lastClaude = Date()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let base = NSHomeDirectory() + "/.claude/projects"
+            let fm = FileManager.default
+            let cal = Calendar.current
+            var tokens = 0, msgs = 0
+            if let projects = try? fm.contentsOfDirectory(atPath: base) {
+                for proj in projects {
+                    let dir = base + "/" + proj
+                    guard let files = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+                    for f in files where f.hasSuffix(".jsonl") {
+                        let path = dir + "/" + f
+                        guard let attrs = try? fm.attributesOfItem(atPath: path),
+                              let mod = attrs[.modificationDate] as? Date, cal.isDateInToday(mod),
+                              let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+                        for line in content.split(separator: "\n") where line.contains("output_tokens") {
+                            guard let d = line.data(using: .utf8),
+                                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                                  let msg = obj["message"] as? [String: Any],
+                                  let usage = msg["usage"] as? [String: Any] else { continue }
+                            tokens += (usage["output_tokens"] as? Int ?? 0) + (usage["input_tokens"] as? Int ?? 0)
+                            msgs += 1
+                        }
+                    }
+                }
+            }
+            DispatchQueue.main.async { self?.tokensToday = tokens; self?.messagesToday = msgs }
+        }
+    }
+}
+
+struct AITab: View {
+    @ObservedObject var model: AIModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Button { model.openDashboard() } label: {
+                HStack(spacing: 10) {
+                    Circle().fill(model.omlxRunning ? Gruv.green : Gruv.red).frame(width: 8, height: 8)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("oMLX").foregroundStyle(Gruv.fg1)
+                        Text(model.omlxRunning
+                             ? "Running · \(model.omlxModels.count) model\(model.omlxModels.count == 1 ? "" : "s")"
+                             : "Stopped")
+                            .font(.caption).foregroundStyle(model.omlxRunning ? Gruv.green : Gruv.gray)
+                    }
+                    Spacer()
+                    Image(systemName: "arrow.up.forward.app").font(.caption).foregroundStyle(Gruv.fg4)
+                }
+                .padding(.vertical, 9).padding(.horizontal, 10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Gruv.bg1.opacity(0.5)))
+            }
+            .buttonStyle(.plain)
+
+            if !model.omlxModels.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Loaded").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                    ForEach(model.omlxModels, id: \.self) { m in
+                        HStack(spacing: 8) {
+                            Image(systemName: "cpu").font(.caption).foregroundStyle(Gruv.aqua).frame(width: 16)
+                            Text(m).font(.callout).foregroundStyle(Gruv.fg2).lineLimit(1)
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Claude Code · today").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                    .padding(.bottom, 4)
+                statRow("Tokens", model.tokensToday > 0 ? fmt(model.tokensToday) : "—")
+                statRow("Messages", "\(model.messagesToday)")
+            }
+            Spacer()
+        }
+    }
+
+    private func statRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(Gruv.fg4)
+            Spacer()
+            Text(value).foregroundStyle(Gruv.fg1).monospacedDigit()
+        }
+        .font(.callout)
+        .padding(.vertical, 8)
+        .overlay(Rectangle().fill(Gruv.bg3.opacity(0.25)).frame(height: 1), alignment: .bottom)
+    }
+
+    private func fmt(_ n: Int) -> String {
+        n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1_000_000)
+                       : (n >= 1000 ? String(format: "%.1fk", Double(n) / 1000) : "\(n)")
+    }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -2113,12 +2262,13 @@ final class PanelController {
     let unifi = UniFiModel()
     let vpn = VPNModel()
     let ha = HAModel()
+    let ai = AIModel()
     let system = SystemModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
-    private let size = NSSize(width: 380, height: 560)
+    private let size = NSSize(width: 380, height: 600)
 
     init() {
         let visual = NSVisualEffectView()
@@ -2131,7 +2281,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, system: system))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, ai: ai, system: system))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -2169,6 +2319,7 @@ final class PanelController {
         if panel.isVisible && tab == .unifi { unifi.startPolling() } else { unifi.stopPolling() }
         if panel.isVisible && tab == .vpn { vpn.startPolling() } else { vpn.stopPolling() }
         if panel.isVisible && tab == .home { ha.startPolling() } else { ha.stopPolling() }
+        if panel.isVisible && tab == .ai { ai.startPolling() } else { ai.stopPolling() }
     }
 
     func toggle(tab: Tab) {
