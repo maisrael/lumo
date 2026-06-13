@@ -1275,10 +1275,11 @@ final class NetworkModel: ObservableObject {
     }
 
     private func currentSSID() -> String {
+        // Prefer CoreWLAN (same source the scan uses, so SSIDs match exactly).
+        if let s = CWWiFiClient.shared().interface()?.ssid(), !s.isEmpty { return s }
         let out = sh("/usr/sbin/ipconfig", ["getsummary", dev]) ?? ""
         for sub in out.split(separator: "\n") {
             let t = sub.trimmingCharacters(in: .whitespaces)
-            // Match the "SSID : x" line, not "BSSID : <mac>".
             guard t.hasPrefix("SSID ") || t.hasPrefix("SSID:") else { continue }
             if let r = t.range(of: ":") {
                 return String(t[r.upperBound...]).trimmingCharacters(in: .whitespaces)
