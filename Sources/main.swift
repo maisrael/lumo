@@ -1003,7 +1003,7 @@ final class PowerModel: ObservableObject {
     func startPolling() {
         stopPolling()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
     func stopPolling() { timer?.invalidate(); timer = nil }
