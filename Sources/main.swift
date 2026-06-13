@@ -38,7 +38,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, system
+    case calendar, timer, music, sound, power, network, system
 
     var id: String { rawValue }
 
@@ -49,6 +49,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .music:    return "Now Playing"
         case .sound:    return "Sound"
         case .power:    return "Power"
+        case .network:  return "Network"
         case .system:   return "System"
         }
     }
@@ -60,6 +61,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .music:    return "music.note"
         case .sound:    return "speaker.wave.2.fill"
         case .power:    return "bolt.fill"
+        case .network:  return "wifi"
         case .system:   return "slider.horizontal.3"
         }
     }
@@ -100,6 +102,7 @@ struct PanelView: View {
     @ObservedObject var sound: SoundModel
     @ObservedObject var bluetooth: BluetoothModel
     @ObservedObject var power: PowerModel
+    @ObservedObject var network: NetworkModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -139,6 +142,7 @@ struct PanelView: View {
                 case .music:    MusicTab(model: nowPlaying)
                 case .sound:    SoundTab(model: sound, bt: bluetooth)
                 case .power:    PowerTab(model: power)
+                case .network:  NetworkTab(model: network)
                 case .system:   SystemTab()
                 }
             }
@@ -1135,6 +1139,156 @@ struct PowerTab: View {
     }
 }
 
+// MARK: - Network (Wi-Fi toggle, current network, service priority)
+
+final class NetworkModel: ObservableObject {
+    @Published var wifiOn = true
+    @Published var ssid = "—"
+    @Published var ip = "—"
+    @Published var wifiFirst = true
+    @Published var working = false
+
+    private let dev = "en0"           // Wi-Fi interface on this Mac
+    private let wifiService = "Wi-Fi" // service name in the order list
+    private var order: [String] = []
+
+    func refresh() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let on = (self.sh("/usr/sbin/networksetup", ["-getairportpower", self.dev]) ?? "").contains(": On")
+            let ssid = self.currentSSID()
+            let ip = (self.sh("/usr/sbin/ipconfig", ["getifaddr", self.dev]) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let ord = self.readOrder()
+            DispatchQueue.main.async {
+                self.wifiOn = on
+                self.ssid = on ? (ssid.isEmpty ? "Not connected" : ssid) : "Off"
+                self.ip = ip.isEmpty ? "—" : ip
+                self.order = ord
+                self.wifiFirst = ord.first == self.wifiService
+            }
+        }
+    }
+
+    func toggleWiFi() {
+        let target = wifiOn ? "off" : "on"
+        wifiOn.toggle()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            _ = self.sh("/usr/sbin/networksetup", ["-setairportpower", self.dev, target])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.refresh() }
+        }
+    }
+
+    func setWiFiPriority(first: Bool) {
+        guard !order.isEmpty else { return }
+        var names = order.filter { $0 != wifiService }
+        if first { names.insert(wifiService, at: 0) } else { names.append(wifiService) }
+        let cmd = "/usr/sbin/networksetup -ordernetworkservices " + names.map { "'\($0)'" }.joined(separator: " ")
+        let script = "do shell script \"\(cmd)\" with administrator privileges"
+        working = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            _ = self.sh("/usr/bin/osascript", ["-e", script])
+            DispatchQueue.main.async { self.working = false; self.refresh() }
+        }
+    }
+
+    private func currentSSID() -> String {
+        let out = sh("/usr/sbin/ipconfig", ["getsummary", dev]) ?? ""
+        for line in out.split(separator: "\n") where line.contains("SSID") {
+            if let r = line.range(of: "SSID") {
+                return line[r.upperBound...].drop { $0 == " " || $0 == ":" }
+                    .trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return ""
+    }
+
+    private func readOrder() -> [String] {
+        let out = sh("/usr/sbin/networksetup", ["-listnetworkserviceorder"]) ?? ""
+        var result: [String] = []
+        for sub in out.split(separator: "\n") {
+            let s = String(sub)
+            if let r = s.range(of: #"^\([*0-9]+\)\s+"#, options: .regularExpression) {
+                result.append(String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces))
+            }
+        }
+        return result
+    }
+
+    private func sh(_ path: String, _ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        let d = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+        return String(data: d, encoding: .utf8)
+    }
+}
+
+struct NetworkTab: View {
+    @ObservedObject var model: NetworkModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 11) {
+                Image(systemName: model.wifiOn ? "wifi" : "wifi.slash")
+                    .font(.system(size: 18))
+                    .foregroundStyle(model.wifiOn ? Gruv.aqua : Gruv.fg4)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Wi-Fi").foregroundStyle(Gruv.fg1)
+                    Text(model.ssid).font(.caption).foregroundStyle(Gruv.gray).lineLimit(1)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(get: { model.wifiOn }, set: { _ in model.toggleWiFi() }))
+                    .labelsHidden().tint(Gruv.green)
+            }
+
+            row("IP address", model.ip)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Priority").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                Text(model.wifiFirst ? "Wi-Fi preferred over Ethernet"
+                                     : "Ethernet preferred over Wi-Fi")
+                    .font(.caption).foregroundStyle(Gruv.gray)
+                HStack(spacing: 8) {
+                    priorityButton("Wi-Fi First", active: model.wifiFirst) { model.setWiFiPriority(first: true) }
+                    priorityButton("Wi-Fi Last", active: !model.wifiFirst) { model.setWiFiPriority(first: false) }
+                }
+                .disabled(model.working)
+                .opacity(model.working ? 0.5 : 1)
+            }
+            Spacer()
+        }
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(Gruv.fg4)
+            Spacer()
+            Text(value).foregroundStyle(Gruv.fg1)
+        }
+        .font(.callout)
+        .padding(.vertical, 9)
+        .overlay(Rectangle().fill(Gruv.bg3.opacity(0.3)).frame(height: 1), alignment: .bottom)
+    }
+
+    private func priorityButton(_ label: String, active: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.callout.weight(.medium))
+                .frame(maxWidth: .infinity).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 9)
+                    .fill(active ? Gruv.aqua.opacity(0.22) : Gruv.bg1.opacity(0.7)))
+                .foregroundStyle(active ? Gruv.aqua : Gruv.fg2)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -1150,6 +1304,7 @@ final class PanelController {
     let sound = SoundModel()
     let bluetooth = BluetoothModel()
     let power = PowerModel()
+    let network = NetworkModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -1167,7 +1322,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -1201,6 +1356,7 @@ final class PanelController {
         else { nowPlaying.stopPolling() }
         if panel.isVisible && tab == .sound { sound.refresh(); bluetooth.refresh() }
         if panel.isVisible && tab == .power { power.startPolling() } else { power.stopPolling() }
+        if panel.isVisible && tab == .network { network.refresh() }
     }
 
     func toggle(tab: Tab) {
