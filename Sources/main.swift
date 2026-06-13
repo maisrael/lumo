@@ -391,6 +391,7 @@ struct MusicTab: View {
                 }
                 progressBar
                 controls
+                openSpotifyButton
                 Spacer()
             }
         } else {
@@ -400,10 +401,26 @@ struct MusicTab: View {
                     .frame(height: 150)
                     .overlay(Image(systemName: "music.note").font(.largeTitle).foregroundStyle(Gruv.gray))
                 Text("Nothing playing").font(.headline).foregroundStyle(Gruv.fg2)
-                Text("Start Spotify and hit play").font(.callout).foregroundStyle(Gruv.gray)
+                openSpotifyButton
                 Spacer()
             }
         }
+    }
+
+    private var openSpotifyButton: some View {
+        Button { AppLauncher.open("com.spotify.client") } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.forward.app")
+                Text("Open Spotify")
+            }
+            .font(.callout.weight(.medium))
+            .foregroundStyle(Gruv.aqua)
+            .padding(.vertical, 7)
+            .padding(.horizontal, 16)
+            .background(RoundedRectangle(cornerRadius: 9).fill(Gruv.bg1.opacity(0.7)))
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 4)
     }
 
     private var artwork: some View {
