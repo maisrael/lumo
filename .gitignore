@@ -1,3 +1,4 @@
 Lumo.app/
 *.o
 .DS_Store
+.unifi-creds

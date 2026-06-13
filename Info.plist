@@ -26,6 +26,11 @@
     <string>Lumo lists and connects your paired Bluetooth audio devices.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>Lumo needs Location access to scan for nearby Wi-Fi networks (a macOS requirement).</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
