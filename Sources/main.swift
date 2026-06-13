@@ -2051,6 +2051,11 @@ struct VPNTab: View {
 
 final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    // Allow positioning off-screen (above the top edge) so the slide-down
+    // animation can start fully hidden instead of being clamped on-screen.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
 }
 
 // MARK: - Panel controller
@@ -2133,31 +2138,53 @@ final class PanelController {
         }
     }
 
+    private var animTimer: Timer?
+
+    // Manual frame-stepped animation — reliable regardless of NSWindow animator quirks.
+    private func animateOrigin(to target: NSPoint, duration: Double, easeOut: Bool, then: (() -> Void)? = nil) {
+        animTimer?.invalidate()
+        let start = panel.frame.origin
+        let total = max(1, Int(duration * 60))
+        var i = 0
+        animTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            i += 1
+            let p = min(1.0, Double(i) / Double(total))
+            let e = easeOut ? 1 - pow(1 - p, 3) : p * p
+            self.panel.setFrameOrigin(NSPoint(x: start.x + (target.x - start.x) * e,
+                                              y: start.y + (target.y - start.y) * e))
+            if p >= 1.0 { t.invalidate(); self.animTimer = nil; then?() }
+        }
+        RunLoop.main.add(animTimer!, forMode: .common)   // keep firing during event tracking
+    }
+
     private func show() {
         let final = topRightOrigin()
-        // Start a touch higher + transparent, then slide down into place.
-        panel.setFrameOrigin(NSPoint(x: final.x, y: final.y + 10))
-        panel.alphaValue = 0
+        panel.alphaValue = 1
+        panel.setFrameOrigin(NSPoint(x: final.x, y: final.y + size.height))   // start fully above
         panel.makeKeyAndOrderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.16
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
-            panel.animator().setFrameOrigin(final)
-        }
+        animateOrigin(to: final, duration: 0.24, easeOut: true)
         installMonitors()
         updatePolling(forTab: state.tab)
     }
 
     private func hide() {
         removeMonitors()
+        stopAllPolling()
+        let final = topRightOrigin()
+        animateOrigin(to: NSPoint(x: final.x, y: final.y + size.height), duration: 0.16, easeOut: false) { [weak self] in
+            guard let self else { return }
+            self.panel.orderOut(nil)
+            self.panel.setFrameOrigin(final)   // reset for next open
+        }
+    }
+
+    private func stopAllPolling() {
         nowPlaying.stopPolling()
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.11
-            panel.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            self?.panel.orderOut(nil)
-        })
+        power.stopPolling()
+        unifi.stopPolling()
+        vpn.stopPolling()
+        ha.stopPolling()
     }
 
     private func topRightOrigin() -> NSPoint {
