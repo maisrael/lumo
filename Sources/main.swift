@@ -1553,6 +1553,7 @@ struct UniFiStatus: Codable {
 final class UniFiModel: NSObject, ObservableObject, URLSessionDelegate {
     @Published var status = UniFiStatus()
     @Published var loading = false
+    @Published private(set) var everLoaded = false
     @Published var configured = false
 
     private var session: URLSession!
@@ -1643,6 +1644,7 @@ final class UniFiModel: NSObject, ObservableObject, URLSessionDelegate {
             }
             await MainActor.run {
                 self.loading = false
+                self.everLoaded = true
                 if s.reachable {                       // only update on success; keep cache on failure
                     self.status = s
                     if let data = try? JSONEncoder().encode(s) {
@@ -1747,7 +1749,9 @@ struct UniFiTab: View {
                     .font(.caption).foregroundStyle(ok(s.wanStatus))
             }
             Spacer()
-            if model.loading { Text("updating…").font(.caption2).foregroundStyle(Gruv.gray) }
+            if model.loading && !model.everLoaded {
+                Text("updating…").font(.caption2).foregroundStyle(Gruv.gray)
+            }
         }
         .padding(.bottom, 4)
     }
