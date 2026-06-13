@@ -1211,7 +1211,7 @@ struct PowerTab: View {
 
 // MARK: - Network (Wi-Fi toggle, current network, service priority)
 
-struct WiFiNetwork: Identifiable, Equatable {
+struct WiFiNetwork: Identifiable, Equatable, Codable {
     let id: String
     let ssid: String
     let rssi: Int
@@ -1219,6 +1219,23 @@ struct WiFiNetwork: Identifiable, Equatable {
 }
 
 final class NetworkModel: ObservableObject {
+    private struct NetCache: Codable {
+        var ssid = "—"; var ip = "—"; var publicIP = "…"; var wifiFirst = true; var networks: [WiFiNetwork] = []
+    }
+    private var lastScan = Date.distantPast
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: "net.cache"),
+           let c = try? JSONDecoder().decode(NetCache.self, from: data) {
+            ssid = c.ssid; ip = c.ip; publicIP = c.publicIP; wifiFirst = c.wifiFirst; networks = c.networks
+        }
+    }
+
+    private func saveCache() {
+        let c = NetCache(ssid: ssid, ip: ip, publicIP: publicIP, wifiFirst: wifiFirst, networks: networks)
+        if let data = try? JSONEncoder().encode(c) { UserDefaults.standard.set(data, forKey: "net.cache") }
+    }
+
     @Published var wifiOn = true
     @Published var ssid = "—"
     @Published var ip = "—"
@@ -1233,8 +1250,10 @@ final class NetworkModel: ObservableObject {
     private let wifiService = "Wi-Fi" // service name in the order list
     private var order: [String] = []
 
-    func scan() {
+    func scan(force: Bool = false) {
         guard !scanning else { return }
+        // Cached and fresh → skip the slow re-scan, keep showing what we have.
+        if !force, !networks.isEmpty, Date().timeIntervalSince(lastScan) < 25 { return }
         scanning = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var found: [WiFiNetwork] = []
@@ -1253,7 +1272,14 @@ final class NetworkModel: ObservableObject {
                 }
             }
             found.sort { $0.rssi > $1.rssi }
-            DispatchQueue.main.async { self?.networks = found; self?.scanning = false }
+            DispatchQueue.main.async {
+                self?.scanning = false
+                if !found.isEmpty {                    // don't wipe the cache on a failed/empty scan
+                    self?.networks = found
+                    self?.lastScan = Date()
+                    self?.saveCache()
+                }
+            }
         }
     }
 
@@ -1287,6 +1313,7 @@ final class NetworkModel: ObservableObject {
                 self.ip = ip.isEmpty ? "—" : ip
                 self.order = ord
                 self.wifiFirst = ord.first == self.wifiService
+                self.saveCache()
             }
         }
         fetchPublicIP()
@@ -1299,6 +1326,7 @@ final class NetworkModel: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             DispatchQueue.main.async {
                 self?.publicIP = (ip?.isEmpty == false) ? ip! : "unavailable"
+                self?.saveCache()
             }
         }.resume()
     }
@@ -1415,13 +1443,11 @@ struct NetworkTab: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text("Networks").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                if model.scanning { Text("updating…").font(.caption2).foregroundStyle(Gruv.gray) }
                 Spacer()
-                Button { model.scan() } label: {
+                Button { model.scan(force: true) } label: {
                     Image(systemName: "arrow.clockwise").font(.caption).foregroundStyle(Gruv.fg4)
                 }.buttonStyle(.plain).disabled(model.scanning)
-            }
-            if model.scanning && model.networks.isEmpty {
-                Text("Scanning…").font(.caption).foregroundStyle(Gruv.gray)
             }
             ForEach(model.networks) { net in
                 networkRow(net)
@@ -1502,7 +1528,7 @@ struct NetworkTab: View {
 
 // MARK: - UniFi (controller stats via local account)
 
-struct WANLink: Identifiable {
+struct WANLink: Identifiable, Codable {
     var id: String { name }
     var name: String
     var availability: Double
@@ -1510,7 +1536,7 @@ struct WANLink: Identifiable {
     var active: Bool
 }
 
-struct UniFiStatus {
+struct UniFiStatus: Codable {
     var reachable = false
     var wanStatus = ""
     var wanIP = ""
@@ -1540,6 +1566,11 @@ final class UniFiModel: NSObject, ObservableObject, URLSessionDelegate {
         cfg.timeoutIntervalForRequest = 6
         session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         loadConfig()
+        // Show last-known data instantly on launch.
+        if let data = UserDefaults.standard.data(forKey: "unifi.cache"),
+           let cached = try? JSONDecoder().decode(UniFiStatus.self, from: data) {
+            status = cached
+        }
     }
 
     private func loadConfig() {
@@ -1611,7 +1642,15 @@ final class UniFiModel: NSObject, ObservableObject, URLSessionDelegate {
                     s.links[i].active = true
                 }
             }
-            await MainActor.run { self.status = s; self.loading = false }
+            await MainActor.run {
+                self.loading = false
+                if s.reachable {                       // only update on success; keep cache on failure
+                    self.status = s
+                    if let data = try? JSONEncoder().encode(s) {
+                        UserDefaults.standard.set(data, forKey: "unifi.cache")
+                    }
+                }
+            }
         }
     }
 
@@ -1709,7 +1748,7 @@ struct UniFiTab: View {
                     .font(.caption).foregroundStyle(ok(s.wanStatus))
             }
             Spacer()
-            if model.loading { ProgressView().controlSize(.small) }
+            if model.loading { Text("updating…").font(.caption2).foregroundStyle(Gruv.gray) }
         }
         .padding(.bottom, 4)
     }
@@ -2140,8 +2179,17 @@ final class PanelController {
 
     private var animTimer: Timer?
 
+    // Bounce: drops past the resting spot, then settles back up.
+    private static func easeOutBack(_ p: Double) -> Double {
+        let s = 1.5
+        let q = p - 1
+        return 1 + (s + 1) * (q * q * q) + s * (q * q)
+    }
+    private static func easeInQuad(_ p: Double) -> Double { p * p }
+
     // Manual frame-stepped animation — reliable regardless of NSWindow animator quirks.
-    private func animateOrigin(to target: NSPoint, duration: Double, easeOut: Bool, then: (() -> Void)? = nil) {
+    private func animateOrigin(to target: NSPoint, duration: Double,
+                               curve: @escaping (Double) -> Double, then: (() -> Void)? = nil) {
         animTimer?.invalidate()
         let start = panel.frame.origin
         let total = max(1, Int(duration * 60))
@@ -2150,7 +2198,7 @@ final class PanelController {
             guard let self else { t.invalidate(); return }
             i += 1
             let p = min(1.0, Double(i) / Double(total))
-            let e = easeOut ? 1 - pow(1 - p, 3) : p * p
+            let e = curve(p)
             self.panel.setFrameOrigin(NSPoint(x: start.x + (target.x - start.x) * e,
                                               y: start.y + (target.y - start.y) * e))
             if p >= 1.0 { t.invalidate(); self.animTimer = nil; then?() }
@@ -2163,7 +2211,7 @@ final class PanelController {
         panel.alphaValue = 1
         panel.setFrameOrigin(NSPoint(x: final.x, y: final.y + size.height))   // start fully above
         panel.makeKeyAndOrderFront(nil)
-        animateOrigin(to: final, duration: 0.24, easeOut: true)
+        animateOrigin(to: final, duration: 0.34, curve: Self.easeOutBack)
         installMonitors()
         updatePolling(forTab: state.tab)
     }
@@ -2172,7 +2220,8 @@ final class PanelController {
         removeMonitors()
         stopAllPolling()
         let final = topRightOrigin()
-        animateOrigin(to: NSPoint(x: final.x, y: final.y + size.height), duration: 0.16, easeOut: false) { [weak self] in
+        animateOrigin(to: NSPoint(x: final.x, y: final.y + size.height),
+                      duration: 0.16, curve: Self.easeInQuad) { [weak self] in
             guard let self else { return }
             self.panel.orderOut(nil)
             self.panel.setFrameOrigin(final)   // reset for next open
