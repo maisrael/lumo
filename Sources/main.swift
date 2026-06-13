@@ -40,7 +40,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, network, unifi, vpn, system
+    case calendar, timer, music, sound, power, network, unifi, vpn, home, system
 
     var id: String { rawValue }
 
@@ -54,6 +54,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .network:  return "Network"
         case .unifi:    return "UniFi"
         case .vpn:      return "VPN"
+        case .home:     return "Home"
         case .system:   return "System"
         }
     }
@@ -68,6 +69,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .network:  return "wifi"
         case .unifi:    return "shield.lefthalf.filled"
         case .vpn:      return "lock.fill"
+        case .home:     return "house.fill"
         case .system:   return "slider.horizontal.3"
         }
     }
@@ -119,6 +121,7 @@ struct PanelView: View {
     @ObservedObject var network: NetworkModel
     @ObservedObject var unifi: UniFiModel
     @ObservedObject var vpn: VPNModel
+    @ObservedObject var ha: HAModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -126,7 +129,7 @@ struct PanelView: View {
             Rectangle().fill(Gruv.bg3.opacity(0.4)).frame(width: 1)
             content
         }
-        .frame(width: 380, height: 500)
+        .frame(width: 380, height: 560)
         .background(Gruv.bg0.opacity(0.72))
     }
 
@@ -161,6 +164,7 @@ struct PanelView: View {
                 case .network:  NetworkTab(model: network)
                 case .unifi:    UniFiTab(model: unifi)
                 case .vpn:      VPNTab(model: vpn)
+                case .home:     HATab(model: ha)
                 case .system:   SystemTab()
                 }
             }
@@ -1687,6 +1691,206 @@ struct UniFiTab: View {
     }
 }
 
+// MARK: - Home Assistant (lights + cottage entities)
+
+struct HAEntity: Identifiable {
+    var id: String { entityId }
+    let entityId: String
+    let domain: String
+    let name: String
+    var state: String
+    var unit: String
+    var currentTemp: Double?
+}
+
+final class HAModel: NSObject, ObservableObject, URLSessionDelegate {
+    @Published var lights: [HAEntity] = []
+    @Published var sensors: [HAEntity] = []
+    @Published var configured = false
+    @Published var reachable = false
+    @Published var busy: Set<String> = []
+
+    private var url = "", token = ""
+    private var wanted: [String] = []
+    private var session: URLSession!
+    private var timer: Timer?
+
+    override init() {
+        super.init()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 6
+        session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+        loadConfig()
+    }
+
+    private func loadConfig() {
+        let path = NSHomeDirectory() + "/.config/lumo/ha.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { configured = false; return }
+        url = (j["url"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        token = j["token"] as? String ?? ""
+        wanted = j["entities"] as? [String] ?? []
+        configured = !url.isEmpty && !token.isEmpty && !wanted.isEmpty
+    }
+
+    func startPolling() {
+        guard configured else { return }
+        stopPolling(); refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+    func stopPolling() { timer?.invalidate(); timer = nil }
+
+    func refresh() { guard configured else { return }; Task { [weak self] in await self?.load() } }
+
+    func toggle(_ e: HAEntity) {
+        guard e.domain == "light" || e.domain == "switch" else { return }
+        busy.insert(e.entityId)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.callService(domain: e.domain, service: "toggle", entity: e.entityId)
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            await self.load()
+            await MainActor.run { self.busy.remove(e.entityId) }
+        }
+    }
+
+    private func load() async {
+        guard let states = await getStates() else {
+            await MainActor.run { self.reachable = false }; return
+        }
+        var byId: [String: [String: Any]] = [:]
+        for s in states { if let id = s["entity_id"] as? String { byId[id] = s } }
+        var lts: [HAEntity] = [], sns: [HAEntity] = []
+        for id in wanted {
+            guard let s = byId[id] else { continue }
+            let domain = String(id.prefix { $0 != "." })
+            let attrs = s["attributes"] as? [String: Any] ?? [:]
+            var e = HAEntity(entityId: id, domain: domain,
+                             name: attrs["friendly_name"] as? String ?? id,
+                             state: s["state"] as? String ?? "",
+                             unit: attrs["unit_of_measurement"] as? String ?? "",
+                             currentTemp: attrs["current_temperature"] as? Double)
+            if e.domain == "light" || e.domain == "switch" { lts.append(e) } else { sns.append(e) }
+        }
+        await MainActor.run { self.lights = lts; self.sensors = sns; self.reachable = true }
+    }
+
+    private func getStates() async -> [[String: Any]]? {
+        guard let u = URL(string: url + "/api/states") else { return nil }
+        var req = URLRequest(url: u)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, resp) = try? await session.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        return arr
+    }
+
+    private func callService(domain: String, service: String, entity: String) async {
+        guard let u = URL(string: url + "/api/services/\(domain)/\(service)") else { return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["entity_id": entity])
+        _ = try? await session.data(for: req)
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else { completionHandler(.performDefaultHandling, nil) }
+    }
+}
+
+struct HATab: View {
+    @ObservedObject var model: HAModel
+
+    var body: some View {
+        if !model.configured {
+            hint("No HA config", "Add ~/.config/lumo/ha.json")
+        } else if !model.reachable && model.lights.isEmpty && model.sensors.isEmpty {
+            hint("Home Assistant unreachable", "On home network or Twingate?")
+        } else {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !model.lights.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Lights").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                            ForEach(model.lights) { lightRow($0) }
+                        }
+                    }
+                    if !model.sensors.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Mökki").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                            ForEach(model.sensors) { sensorRow($0) }
+                        }
+                    }
+                }
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    private func lightRow(_ e: HAEntity) -> some View {
+        let on = e.state == "on"
+        let off = e.state == "unavailable"
+        return HStack(spacing: 10) {
+            Image(systemName: on ? "lightbulb.fill" : "lightbulb")
+                .frame(width: 20)
+                .foregroundStyle(on ? Gruv.yellow : Gruv.fg4)
+            Text(e.name).foregroundStyle(off ? Gruv.fg4 : Gruv.fg1).lineLimit(1)
+            Spacer()
+            if model.busy.contains(e.entityId) {
+                ProgressView().controlSize(.small)
+            } else if off {
+                Text("unavailable").font(.caption2).foregroundStyle(Gruv.gray)
+            } else {
+                Toggle("", isOn: Binding(get: { on }, set: { _ in model.toggle(e) }))
+                    .labelsHidden().tint(Gruv.green)
+            }
+        }
+        .font(.callout)
+        .padding(.vertical, 5)
+    }
+
+    private func sensorRow(_ e: HAEntity) -> some View {
+        HStack {
+            Image(systemName: icon(e)).frame(width: 20).foregroundStyle(Gruv.aqua)
+            Text(e.name).foregroundStyle(Gruv.fg1).lineLimit(1)
+            Spacer()
+            Text(value(e)).foregroundStyle(Gruv.fg0).monospacedDigit()
+        }
+        .font(.callout)
+        .padding(.vertical, 6)
+        .overlay(Rectangle().fill(Gruv.bg3.opacity(0.25)).frame(height: 1), alignment: .bottom)
+    }
+
+    private func icon(_ e: HAEntity) -> String {
+        if e.domain == "climate" { return "thermometer.medium" }
+        let n = e.name.lowercased()
+        if n.contains("temperature") { return "thermometer" }
+        if n.contains("energy") { return "bolt" }
+        return "sensor"
+    }
+
+    private func value(_ e: HAEntity) -> String {
+        if e.domain == "climate" {
+            let t = e.currentTemp.map { String(format: "%.0f°", $0) } ?? ""
+            return "\(e.state.capitalized) \(t)".trimmingCharacters(in: .whitespaces)
+        }
+        let u = e.unit.isEmpty ? "" : " \(e.unit)"
+        return e.state + u
+    }
+
+    private func hint(_ title: String, _ sub: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline).foregroundStyle(Gruv.fg2)
+            Text(sub).font(.callout).foregroundStyle(Gruv.gray)
+        }.padding(.top, 8)
+    }
+}
+
 // MARK: - VPN (Twingate / OpenVPN / NordVPN — detect via utun + process)
 
 struct VPNEntry: Identifiable {
@@ -1812,11 +2016,12 @@ final class PanelController {
     let network = NetworkModel()
     let unifi = UniFiModel()
     let vpn = VPNModel()
+    let ha = HAModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
-    private let size = NSSize(width: 380, height: 500)
+    private let size = NSSize(width: 380, height: 560)
 
     init() {
         let visual = NSVisualEffectView()
@@ -1829,7 +2034,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -1866,6 +2071,7 @@ final class PanelController {
         if panel.isVisible && tab == .network { network.refresh(); network.scan() }
         if panel.isVisible && tab == .unifi { unifi.startPolling() } else { unifi.stopPolling() }
         if panel.isVisible && tab == .vpn { vpn.startPolling() } else { vpn.stopPolling() }
+        if panel.isVisible && tab == .home { ha.startPolling() } else { ha.stopPolling() }
     }
 
     func toggle(tab: Tab) {
