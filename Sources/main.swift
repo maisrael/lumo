@@ -2124,10 +2124,10 @@ final class AIModel: ObservableObject {
     }
     func stopPolling() { timer?.invalidate(); timer = nil }
 
-    func openDashboard() { AppLauncher.openURL("http://localhost:8000/admin") }
+    func openDashboard() { AppLauncher.openURL("http://127.0.0.1:8000/admin") }
 
     private func refreshOMLX() {
-        guard let url = URL(string: "http://localhost:8000/v1/models") else { return }
+        guard let url = URL(string: "http://127.0.0.1:8000/v1/models") else { return }
         var req = URLRequest(url: url, timeoutInterval: 3)
         if !omlxKey.isEmpty { req.setValue("Bearer \(omlxKey)", forHTTPHeaderField: "Authorization") }
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
