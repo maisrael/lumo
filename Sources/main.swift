@@ -122,6 +122,7 @@ struct PanelView: View {
     @ObservedObject var unifi: UniFiModel
     @ObservedObject var vpn: VPNModel
     @ObservedObject var ha: HAModel
+    @ObservedObject var system: SystemModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -165,7 +166,7 @@ struct PanelView: View {
                 case .unifi:    UniFiTab(model: unifi)
                 case .vpn:      VPNTab(model: vpn)
                 case .home:     HATab(model: ha)
-                case .system:   SystemTab()
+                case .system:   SystemTab(model: system)
                 }
             }
             .padding(.horizontal, 18)
@@ -512,17 +513,65 @@ struct MusicTab: View {
     }
 }
 
+final class SystemModel: ObservableObject {
+    @Published var keepAwake = false
+    private var caffeinate: Process?
+
+    func toggleKeepAwake() {
+        keepAwake.toggle()
+        if keepAwake {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+            p.arguments = ["-d", "-i"]   // prevent display + idle sleep until killed
+            try? p.run()
+            caffeinate = p
+        } else {
+            caffeinate?.terminate()
+            caffeinate = nil
+        }
+    }
+
+    func emptyTrash() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", "tell application \"Finder\" to empty trash"]
+        try? p.run()
+        NotificationCenter.default.post(name: .lumoDismiss, object: nil)
+    }
+}
+
 struct SystemTab: View {
-    @State private var dnd = false
+    @ObservedObject var model: SystemModel
+
     var body: some View {
-        VStack(spacing: 12) {
-            Toggle("Do Not Disturb", isOn: $dnd)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 11) {
+                Image(systemName: model.keepAwake ? "cup.and.saucer.fill" : "cup.and.saucer")
+                    .font(.system(size: 17)).frame(width: 22)
+                    .foregroundStyle(model.keepAwake ? Gruv.aqua : Gruv.fg4)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Keep Awake").foregroundStyle(Gruv.fg1)
+                    Text(model.keepAwake ? "Mac won't sleep" : "Normal sleep")
+                        .font(.caption).foregroundStyle(Gruv.gray)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(get: { model.keepAwake }, set: { _ in model.toggleKeepAwake() }))
+                    .labelsHidden().tint(Gruv.green)
+            }
+
+            Button { model.emptyTrash() } label: {
+                HStack(spacing: 11) {
+                    Image(systemName: "trash").font(.system(size: 16)).frame(width: 22).foregroundStyle(Gruv.red)
+                    Text("Empty Trash").foregroundStyle(Gruv.fg1)
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(Gruv.fg4)
+                }
+            }
+            .buttonStyle(.plain)
+
             Spacer()
         }
         .font(.callout)
-        .foregroundStyle(Gruv.fg1)
-        .toggleStyle(.switch)
-        .tint(Gruv.green)
     }
 }
 
@@ -2017,6 +2066,7 @@ final class PanelController {
     let unifi = UniFiModel()
     let vpn = VPNModel()
     let ha = HAModel()
+    let system = SystemModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -2034,7 +2084,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha))
+        let hosting = NSHostingView(rootView: PanelView(state: state, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, system: system))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
