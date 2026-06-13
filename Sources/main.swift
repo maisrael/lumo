@@ -491,11 +491,9 @@ struct MusicTab: View {
 }
 
 struct SystemTab: View {
-    @State private var wifi = true
     @State private var dnd = false
     var body: some View {
         VStack(spacing: 12) {
-            Toggle("Wi-Fi", isOn: $wifi)
             Toggle("Do Not Disturb", isOn: $dnd)
             Spacer()
         }
@@ -1145,6 +1143,7 @@ final class NetworkModel: ObservableObject {
     @Published var wifiOn = true
     @Published var ssid = "—"
     @Published var ip = "—"
+    @Published var publicIP = "…"
     @Published var wifiFirst = true
     @Published var working = false
 
@@ -1168,6 +1167,18 @@ final class NetworkModel: ObservableObject {
                 self.wifiFirst = ord.first == self.wifiService
             }
         }
+        fetchPublicIP()
+    }
+
+    private func fetchPublicIP() {
+        guard let url = URL(string: "https://api.ipify.org") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            let ip = data.flatMap { String(data: $0, encoding: .utf8) }?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                self?.publicIP = (ip?.isEmpty == false) ? ip! : "unavailable"
+            }
+        }.resume()
     }
 
     func toggleWiFi() {
@@ -1247,7 +1258,8 @@ struct NetworkTab: View {
                     .labelsHidden().tint(Gruv.green)
             }
 
-            row("IP address", model.ip)
+            row("Local IP", model.ip)
+            row("Public IP", model.publicIP)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Priority").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
