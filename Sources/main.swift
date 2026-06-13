@@ -6,6 +6,8 @@ import CoreBluetooth
 import IOBluetooth
 import IOKit
 import IOKit.ps
+import CoreWLAN
+import CoreLocation
 
 // MARK: - Gruvbox palette
 
@@ -1139,6 +1141,13 @@ struct PowerTab: View {
 
 // MARK: - Network (Wi-Fi toggle, current network, service priority)
 
+struct WiFiNetwork: Identifiable, Equatable {
+    let id: String
+    let ssid: String
+    let rssi: Int
+    let secure: Bool
+}
+
 final class NetworkModel: ObservableObject {
     @Published var wifiOn = true
     @Published var ssid = "—"
@@ -1146,10 +1155,53 @@ final class NetworkModel: ObservableObject {
     @Published var publicIP = "…"
     @Published var wifiFirst = true
     @Published var working = false
+    @Published var networks: [WiFiNetwork] = []
+    @Published var scanning = false
+    @Published var connecting = ""    // ssid currently being joined
 
     private let dev = "en0"           // Wi-Fi interface on this Mac
     private let wifiService = "Wi-Fi" // service name in the order list
     private var order: [String] = []
+
+    func scan() {
+        guard !scanning else { return }
+        scanning = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var found: [WiFiNetwork] = []
+            if let iface = CWWiFiClient.shared().interface() {
+                // Only networks you've set up (preferred / known profiles).
+                let profiles = iface.configuration()?.networkProfiles.array as? [CWNetworkProfile]
+                let known = Set(profiles?.compactMap { $0.ssid } ?? [])
+                if let set = try? iface.scanForNetworks(withSSID: nil) {
+                    var seen = Set<String>()
+                    for n in set {
+                        guard let s = n.ssid, !s.isEmpty, known.contains(s), !seen.contains(s) else { continue }
+                        seen.insert(s)
+                        found.append(WiFiNetwork(id: s, ssid: s, rssi: n.rssiValue,
+                                                 secure: !n.supportsSecurity(.none)))
+                    }
+                }
+            }
+            found.sort { $0.rssi > $1.rssi }
+            DispatchQueue.main.async { self?.networks = found; self?.scanning = false }
+        }
+    }
+
+    func connect(ssid: String, password: String) {
+        connecting = ssid
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            if let iface = CWWiFiClient.shared().interface(),
+               let set = try? iface.scanForNetworks(withSSID: ssid.data(using: .utf8)),
+               let net = set.first(where: { $0.ssid == ssid }) {
+                try? iface.associate(to: net, password: password.isEmpty ? nil : password)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.connecting = ""
+                self.refresh()
+            }
+        }
+    }
 
     func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -1207,10 +1259,12 @@ final class NetworkModel: ObservableObject {
 
     private func currentSSID() -> String {
         let out = sh("/usr/sbin/ipconfig", ["getsummary", dev]) ?? ""
-        for line in out.split(separator: "\n") where line.contains("SSID") {
-            if let r = line.range(of: "SSID") {
-                return line[r.upperBound...].drop { $0 == " " || $0 == ":" }
-                    .trimmingCharacters(in: .whitespaces)
+        for sub in out.split(separator: "\n") {
+            let t = sub.trimmingCharacters(in: .whitespaces)
+            // Match the "SSID : x" line, not "BSSID : <mac>".
+            guard t.hasPrefix("SSID ") || t.hasPrefix("SSID:") else { continue }
+            if let r = t.range(of: ":") {
+                return String(t[r.upperBound...]).trimmingCharacters(in: .whitespaces)
             }
         }
         return ""
@@ -1241,39 +1295,113 @@ final class NetworkModel: ObservableObject {
 
 struct NetworkTab: View {
     @ObservedObject var model: NetworkModel
+    @State private var selected = ""     // ssid awaiting password
+    @State private var password = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 11) {
-                Image(systemName: model.wifiOn ? "wifi" : "wifi.slash")
-                    .font(.system(size: 18))
-                    .foregroundStyle(model.wifiOn ? Gruv.aqua : Gruv.fg4)
-                    .frame(width: 24)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Wi-Fi").foregroundStyle(Gruv.fg1)
-                    Text(model.ssid).font(.caption).foregroundStyle(Gruv.gray).lineLimit(1)
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 11) {
+                    Image(systemName: model.wifiOn ? "wifi" : "wifi.slash")
+                        .font(.system(size: 18))
+                        .foregroundStyle(model.wifiOn ? Gruv.aqua : Gruv.fg4)
+                        .frame(width: 24)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Wi-Fi").foregroundStyle(Gruv.fg1)
+                        Text(model.ssid).font(.caption).foregroundStyle(Gruv.gray).lineLimit(1)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(get: { model.wifiOn }, set: { _ in model.toggleWiFi() }))
+                        .labelsHidden().tint(Gruv.green)
                 }
+
+                row("Local IP", model.ip)
+                row("Public IP", model.publicIP)
+
+                priority
+                if model.wifiOn { networksList }
+            }
+            .padding(.bottom, 8)
+        }
+    }
+
+    private var priority: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Priority").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+            Text(model.wifiFirst ? "Wi-Fi preferred over Ethernet"
+                                 : "Ethernet preferred over Wi-Fi")
+                .font(.caption).foregroundStyle(Gruv.gray)
+            HStack(spacing: 8) {
+                priorityButton("Wi-Fi First", active: model.wifiFirst) { model.setWiFiPriority(first: true) }
+                priorityButton("Wi-Fi Last", active: !model.wifiFirst) { model.setWiFiPriority(first: false) }
+            }
+            .disabled(model.working)
+            .opacity(model.working ? 0.5 : 1)
+        }
+    }
+
+    private var networksList: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Networks").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
                 Spacer()
-                Toggle("", isOn: Binding(get: { model.wifiOn }, set: { _ in model.toggleWiFi() }))
-                    .labelsHidden().tint(Gruv.green)
+                Button { model.scan() } label: {
+                    Image(systemName: "arrow.clockwise").font(.caption).foregroundStyle(Gruv.fg4)
+                }.buttonStyle(.plain).disabled(model.scanning)
             }
+            if model.scanning && model.networks.isEmpty {
+                Text("Scanning…").font(.caption).foregroundStyle(Gruv.gray)
+            }
+            ForEach(model.networks) { net in
+                networkRow(net)
+            }
+        }
+    }
 
-            row("Local IP", model.ip)
-            row("Public IP", model.publicIP)
+    @ViewBuilder
+    private func networkRow(_ net: WiFiNetwork) -> some View {
+        let isCurrent = net.ssid == model.ssid
+        Button {
+            if isCurrent { return }
+            if net.secure { selected = (selected == net.ssid) ? "" : net.ssid; password = "" }
+            else { model.connect(ssid: net.ssid, password: "") }
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: signalIcon(net.rssi)).frame(width: 18).foregroundStyle(Gruv.fg4)
+                Text(net.ssid).foregroundStyle(isCurrent ? Gruv.aqua : Gruv.fg1).lineLimit(1)
+                if net.secure { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(Gruv.fg4) }
+                Spacer()
+                if model.connecting == net.ssid { ProgressView().controlSize(.small) }
+                else if isCurrent { Image(systemName: "checkmark").foregroundStyle(Gruv.green) }
+            }
+            .font(.callout)
+            .padding(.vertical, 6).padding(.horizontal, 8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isCurrent ? Gruv.bg1.opacity(0.6) : .clear))
+        }
+        .buttonStyle(.plain)
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Priority").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
-                Text(model.wifiFirst ? "Wi-Fi preferred over Ethernet"
-                                     : "Ethernet preferred over Wi-Fi")
-                    .font(.caption).foregroundStyle(Gruv.gray)
-                HStack(spacing: 8) {
-                    priorityButton("Wi-Fi First", active: model.wifiFirst) { model.setWiFiPriority(first: true) }
-                    priorityButton("Wi-Fi Last", active: !model.wifiFirst) { model.setWiFiPriority(first: false) }
+        if selected == net.ssid {
+            HStack(spacing: 8) {
+                SecureField("Password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout)
+                Button("Join") {
+                    model.connect(ssid: net.ssid, password: password)
+                    selected = ""; password = ""
                 }
-                .disabled(model.working)
-                .opacity(model.working ? 0.5 : 1)
+                .buttonStyle(.plain)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(Gruv.aqua)
             }
-            Spacer()
+            .padding(.leading, 27).padding(.bottom, 4)
+        }
+    }
+
+    private func signalIcon(_ rssi: Int) -> String {
+        switch rssi {
+        case (-60)...:   return "wifi"
+        case (-72)..<(-60): return "wifi"
+        default:          return "wifi"   // SF Symbols has no graded wifi; keep uniform
         }
     }
 
@@ -1368,7 +1496,7 @@ final class PanelController {
         else { nowPlaying.stopPolling() }
         if panel.isVisible && tab == .sound { sound.refresh(); bluetooth.refresh() }
         if panel.isVisible && tab == .power { power.startPolling() } else { power.stopPolling() }
-        if panel.isVisible && tab == .network { network.refresh() }
+        if panel.isVisible && tab == .network { network.refresh(); network.scan() }
     }
 
     func toggle(tab: Tab) {
@@ -1437,6 +1565,7 @@ final class PanelController {
 final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelegate {
     let controller = PanelController()
     private var btManager: CBCentralManager?
+    private let locationManager = CLLocationManager()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
@@ -1451,6 +1580,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelega
         // Instantiating a central manager triggers the Bluetooth permission
         // prompt, so blueutil (spawned by us) is allowed to enumerate devices.
         btManager = CBCentralManager(delegate: self, queue: nil)
+        // Location authorization is required by macOS to scan for Wi-Fi networks.
+        locationManager.requestWhenInUseAuthorization()
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {}

@@ -3,10 +3,14 @@ BUNDLE   := $(APP).app
 EXEC     := $(BUNDLE)/Contents/MacOS/$(APP)
 PLIST    := $(BUNDLE)/Contents/Info.plist
 LSREG    := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+SIGN_ID  := Lumo Self-Signed
 
 .PHONY: build run install reload clean
 
+# Sign every build with a stable self-signed identity so macOS TCC grants
+# (Spotify automation, Bluetooth, Location) persist across rebuilds.
 build: $(EXEC) $(PLIST)
+	@codesign --force --sign "$(SIGN_ID)" $(BUNDLE) && echo "[codesign] $(BUNDLE) signed with '$(SIGN_ID)'"
 
 $(EXEC): Sources/*.swift
 	@mkdir -p $(BUNDLE)/Contents/MacOS

@@ -24,6 +24,8 @@
     <string>Lumo reads and controls Spotify playback to show Now Playing.</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Lumo lists and connects your paired Bluetooth audio devices.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Lumo needs Location access to scan for nearby Wi-Fi networks (a macOS requirement).</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
