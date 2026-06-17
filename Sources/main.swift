@@ -9,6 +9,7 @@ import IOKit.ps
 import CoreWLAN
 import CoreLocation
 import EventKit
+import UniformTypeIdentifiers
 
 // MARK: - Gruvbox palette
 
@@ -41,7 +42,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, network, unifi, vpn, home, pi, ai, system
+    case calendar, timer, music, sound, power, network, unifi, vpn, home, pi, ai, system, memes
 
     var id: String { rawValue }
 
@@ -59,6 +60,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .pi:       return "Pi"
         case .ai:       return "AI"
         case .system:   return "System"
+        case .memes:    return "Memes"
         }
     }
 
@@ -76,6 +78,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .pi:       return "server.rack"
         case .ai:       return "sparkles"
         case .system:   return "slider.horizontal.3"
+        case .memes:    return "photo.stack"
         }
     }
 }
@@ -132,6 +135,7 @@ struct PanelView: View {
     @ObservedObject var pi: PiModel
     @ObservedObject var ai: AIModel
     @ObservedObject var system: SystemModel
+    @ObservedObject var memes: MemeLibrary
 
     var body: some View {
         HStack(spacing: 0) {
@@ -144,7 +148,7 @@ struct PanelView: View {
     }
 
     private var rail: some View {
-        VStack(spacing: 7) {
+        VStack(spacing: 3) {
             ForEach(Tab.allCases) { t in
                 RailIcon(tab: t, isActive: state.tab == t) { state.tab = t }
             }
@@ -178,6 +182,7 @@ struct PanelView: View {
                 case .pi:       PiTab(model: pi)
                 case .ai:       AITab(model: ai)
                 case .system:   SystemTab(model: system)
+                case .memes:    MemesTab(model: memes)
                 }
             }
             .padding(.horizontal, 18)
@@ -781,7 +786,7 @@ struct SystemTab: View {
                 }
                 Spacer()
                 Toggle("", isOn: Binding(get: { model.keepAwake }, set: { _ in model.toggleKeepAwake() }))
-                    .labelsHidden().tint(Gruv.green)
+                    .labelsHidden().toggleStyle(.switch).tint(Gruv.green)
             }
 
             Button { model.emptyTrash() } label: {
@@ -1641,7 +1646,7 @@ struct NetworkTab: View {
                     }
                     Spacer()
                     Toggle("", isOn: Binding(get: { model.wifiOn }, set: { _ in model.toggleWiFi() }))
-                        .labelsHidden().tint(Gruv.green)
+                        .labelsHidden().toggleStyle(.switch).tint(Gruv.green)
                 }
 
                 row("Local IP", model.ip)
@@ -1939,7 +1944,26 @@ struct UniFiTab: View {
                 if !s.links.isEmpty { uplinks(s) }
             }
             Spacer()
+            openUIButton
         }
+    }
+
+    // Opens UniFi's global remote portal — works from anywhere, not just the LAN.
+    private var openUIButton: some View {
+        Button { AppLauncher.openURL("https://unifi.ui.com") } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.forward.app").font(.system(size: 14))
+                Text("Open UniFi UI")
+                Spacer()
+            }
+            .font(.callout.weight(.medium))
+            .foregroundStyle(Gruv.aqua)
+            .padding(.vertical, 9)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Gruv.aqua.opacity(0.15)))
+        }
+        .buttonStyle(.plain)
     }
 
     private func uplinks(_ s: UniFiStatus) -> some View {
@@ -2169,7 +2193,7 @@ struct HATab: View {
                 Text("unavailable").font(.caption2).foregroundStyle(Gruv.gray)
             } else {
                 Toggle("", isOn: Binding(get: { on }, set: { _ in model.toggle(e) }))
-                    .labelsHidden().tint(Gruv.green)
+                    .labelsHidden().toggleStyle(.switch).tint(Gruv.green)
             }
         }
         .font(.callout)
@@ -2227,10 +2251,17 @@ final class VPNModel: ObservableObject {
     @Published var twingate = VPNEntry(id: "tg", name: "Twingate", app: "Twingate", active: false, ip: "")
     @Published var openvpn  = VPNEntry(id: "ov", name: "OpenVPN", app: "OpenVPN Connect", active: false, ip: "")
     @Published var nordvpn  = VPNEntry(id: "nd", name: "NordVPN", app: "NordVPN", active: false, ip: "")
+    // Tailscale is *controllable* (connect/disconnect via its CLI), unlike the
+    // launch-only VPNs above. Its IP is also 100.64/10, so we detect it via the
+    // CLI and exclude its address from the Twingate heuristic.
+    @Published var tailscaleUp = false
+    @Published var tailscaleIP = ""
+    @Published var tailscaleBusy = false
 
+    private static let tsBin = "/opt/homebrew/bin/tailscale"
     private var timer: Timer?
     var entries: [VPNEntry] { [twingate, openvpn, nordvpn] }
-    var anyActive: Bool { twingate.active || openvpn.active || nordvpn.active }
+    var anyActive: Bool { twingate.active || openvpn.active || nordvpn.active || tailscaleUp }
 
     func startPolling() {
         stopPolling(); refresh()
@@ -2241,8 +2272,13 @@ final class VPNModel: ObservableObject {
     func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
+            // Tailscale via its CLI (authoritative). `tailscale ip -4` prints the
+            // tailnet IP when up, errors (empty) when down.
+            let tsip = Self.runTS(["ip", "-4"]).split(separator: "\n").first.map(String.init) ?? ""
+            let tsUp = tsip.hasPrefix("100.")
             var tg = false, ov = false, nd = false, tgip = "", ovip = "", ndip = ""
             for ip in self.utunIPv4s() {
+                if ip == tsip { continue }                                          // Tailscale's own utun — handled above
                 if ip.hasPrefix("10.15.10.") || ip.hasPrefix("169.254.") { continue }  // Sidecar / link-local
                 let o = ip.split(separator: ".").compactMap { Int($0) }
                 if o.count == 4 && o[0] == 100 && o[1] >= 64 && o[1] <= 127 { tg = true; tgip = ip }   // CGNAT 100.64/10
@@ -2252,6 +2288,7 @@ final class VPNModel: ObservableObject {
             if tg && !self.processRunning("Twingate") { tg = false; tgip = "" }
             if ov && !self.processRunning("ovpnagent") { ov = false; ovip = "" }
             DispatchQueue.main.async {
+                if !self.tailscaleBusy { self.tailscaleUp = tsUp; self.tailscaleIP = tsip }
                 self.twingate.active = tg; self.twingate.ip = tgip
                 self.openvpn.active = ov;  self.openvpn.ip = ovip
                 self.nordvpn.active = nd;  self.nordvpn.ip = ndip
@@ -2287,6 +2324,28 @@ final class VPNModel: ObservableObject {
         p.waitUntilExit()
         return p.terminationStatus == 0
     }
+
+    // Run the tailscale CLI, return trimmed stdout ("" on failure).
+    private static func runTS(_ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tsBin)
+        p.arguments = args
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        do { try p.run() } catch { return "" }
+        p.waitUntilExit()
+        let d = out.fileHandleForReading.readDataToEndOfFile()
+        return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    func toggleTailscale() {
+        tailscaleBusy = true
+        let goingUp = !tailscaleUp
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = Self.runTS([goingUp ? "up" : "down"])
+            Thread.sleep(forTimeInterval: 0.6)                 // let the interface settle
+            DispatchQueue.main.async { self?.tailscaleBusy = false; self?.refresh() }
+        }
+    }
 }
 
 struct VPNTab: View {
@@ -2294,6 +2353,29 @@ struct VPNTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // Tailscale — connect/disconnect right here (CLI-controlled).
+            HStack(spacing: 11) {
+                Image(systemName: model.tailscaleUp ? "lock.fill" : "lock.open")
+                    .font(.system(size: 16)).frame(width: 22)
+                    .foregroundStyle(model.tailscaleUp ? Gruv.green : Gruv.fg4)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Tailscale").foregroundStyle(Gruv.fg1)
+                    Text(model.tailscaleUp ? "Connected · \(model.tailscaleIP)" : "Off")
+                        .font(.caption)
+                        .foregroundStyle(model.tailscaleUp ? Gruv.green : Gruv.gray)
+                }
+                Spacer()
+                if model.tailscaleBusy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Toggle("", isOn: Binding(get: { model.tailscaleUp }, set: { _ in model.toggleTailscale() }))
+                        .labelsHidden().toggleStyle(.switch).tint(Gruv.green)
+                }
+            }
+            .padding(.vertical, 9).padding(.horizontal, 10)
+            .background(RoundedRectangle(cornerRadius: 10)
+                .fill(model.tailscaleUp ? Gruv.green.opacity(0.12) : Gruv.bg1.opacity(0.5)))
+
             ForEach(model.entries) { vpn in
                 Button { AppLauncher.openApp(named: vpn.app) } label: {
                     HStack(spacing: 11) {
@@ -2327,6 +2409,8 @@ final class AIModel: ObservableObject {
     @Published var omlxModels: [String] = []
     @Published var tokensToday = 0
     @Published var messagesToday = 0
+    @Published var localTokensToday = 0
+    @Published var localRequestsToday = 0
 
     private var omlxKey = ""
     private var timer: Timer?
@@ -2343,9 +2427,11 @@ final class AIModel: ObservableObject {
     func startPolling() {
         stopPolling()
         refreshOMLX()
+        readLocalStats()
         computeClaude()
         timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             self?.refreshOMLX()
+            self?.readLocalStats()
             self?.computeClaude()
         }
     }
@@ -2367,6 +2453,35 @@ final class AIModel: ObservableObject {
             }
             DispatchQueue.main.async { self?.omlxRunning = ok; self?.omlxModels = models }
         }.resume()
+    }
+
+    // oMLX writes a *lifetime* token counter to ~/.omlx/stats.json. We keep a
+    // per-day baseline in UserDefaults and show the delta, so the figure reads
+    // as "today" like the Claude block. Rebases on a new day or if oMLX resets
+    // the counter (current < baseline).
+    private func readLocalStats() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let path = NSHomeDirectory() + "/.omlx/stats.json"
+            guard let data = FileManager.default.contents(atPath: path),
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let totalTokens = (j["total_prompt_tokens"] as? Int ?? 0) + (j["total_completion_tokens"] as? Int ?? 0)
+            let totalReqs = j["total_requests"] as? Int ?? 0
+
+            let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
+            let today = df.string(from: Date())
+            let ud = UserDefaults.standard
+            var baseTokens = ud.integer(forKey: "omlx.base.tokens")
+            var baseReqs = ud.integer(forKey: "omlx.base.requests")
+            if ud.string(forKey: "omlx.base.date") != today || totalTokens < baseTokens || totalReqs < baseReqs {
+                ud.set(today, forKey: "omlx.base.date")
+                ud.set(totalTokens, forKey: "omlx.base.tokens")
+                ud.set(totalReqs, forKey: "omlx.base.requests")
+                baseTokens = totalTokens; baseReqs = totalReqs
+            }
+            let todTokens = max(0, totalTokens - baseTokens)
+            let todReqs = max(0, totalReqs - baseReqs)
+            DispatchQueue.main.async { self?.localTokensToday = todTokens; self?.localRequestsToday = todReqs }
+        }
     }
 
     // Sum today's Claude Code usage from the live transcripts (throttled).
@@ -2436,6 +2551,13 @@ struct AITab: View {
                         }
                     }
                 }
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text("oMLX · today").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                    .padding(.bottom, 4)
+                statRow("Tokens", model.localTokensToday > 0 ? fmt(model.localTokensToday) : "—")
+                statRow("Requests", "\(model.localRequestsToday)")
             }
 
             VStack(alignment: .leading, spacing: 0) {
@@ -2813,6 +2935,297 @@ struct PiTab: View {
     }
 }
 
+// MARK: - Memes (curated picker: grid · fuzzy search · click-to-copy)
+
+let memeUntagged = "tagthis"   // untagged memes carry this so you can search for them
+
+struct Meme: Identifiable, Codable, Equatable {
+    var file: String
+    var tags: [String]
+    var added: Date
+    var id: String { file }
+}
+
+final class MemeLibrary: ObservableObject {
+    @Published var memes: [Meme] = []
+    @Published var search = ""
+    @Published var editingMeme: Meme?          // the meme whose tags are being edited (inline overlay)
+    private let filesDir: URL, trashDir: URL, indexURL: URL
+
+    var filtered: [Meme] {
+        guard !search.isEmpty else { return memes }
+        return memes
+            .compactMap { m in memeFuzzy(search, m.tags.joined(separator: " ") + " " + m.file).map { (m, $0) } }
+            .sorted { $0.1 > $1.1 }.map { $0.0 }
+    }
+
+    init() {
+        let base = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/lumo/memes")
+        filesDir = base.appendingPathComponent("files")
+        trashDir = base.appendingPathComponent("trash")
+        indexURL = base.appendingPathComponent("index.json")
+        for d in [filesDir, trashDir] { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        load()
+    }
+
+    func url(_ m: Meme) -> URL { filesDir.appendingPathComponent(m.file) }
+
+    func load() {
+        var list: [Meme] = []
+        if let data = try? Data(contentsOf: indexURL),
+           let arr = try? JSONDecoder().decode([Meme].self, from: data) {
+            list = arr.filter { FileManager.default.fileExists(atPath: filesDir.appendingPathComponent($0.file).path) }
+        }
+        let known = Set(list.map { $0.file })
+        let exts: Set<String> = ["gif", "png", "jpg", "jpeg", "webp", "heic"]
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: filesDir.path) {
+            for f in files where !f.hasPrefix(".") && !known.contains(f) && exts.contains((f as NSString).pathExtension.lowercased()) {
+                list.append(Meme(file: f, tags: [memeUntagged], added: Date()))
+            }
+        }
+        list.sort { $0.added > $1.added }
+        memes = list
+        persist()
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(memes) { try? data.write(to: indexURL) }
+    }
+
+    func add(data: Data, ext: String, tags: [String] = []) {
+        let name = "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6)).\(ext.isEmpty ? "png" : ext)"
+        try? data.write(to: filesDir.appendingPathComponent(name))
+        memes.insert(Meme(file: name, tags: tags.isEmpty ? [memeUntagged] : tags, added: Date()), at: 0)
+        persist()
+    }
+
+    func setTags(_ m: Meme, _ tags: [String]) {
+        guard let i = memes.firstIndex(where: { $0.id == m.id }) else { return }
+        memes[i].tags = tags.isEmpty ? [memeUntagged] : tags
+        persist()
+    }
+
+    func delete(_ m: Meme) {
+        try? FileManager.default.moveItem(at: url(m), to: trashDir.appendingPathComponent(m.file))
+        memes.removeAll { $0.id == m.id }
+        persist()
+    }
+
+    private static let imgExts: Set<String> = ["gif", "png", "jpg", "jpeg", "webp", "heic"]
+
+    func addFromClipboard() {
+        let pb = NSPasteboard.general
+        // 1. A real file copied in Finder → read the original bytes (keeps GIF animation, exact image).
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let u = urls.first(where: { Self.imgExts.contains($0.pathExtension.lowercased()) }),
+           let data = try? Data(contentsOf: u) { add(data: data, ext: u.pathExtension.lowercased()); return }
+        // 2. Raw GIF bytes.
+        if let gif = pb.data(forType: NSPasteboard.PasteboardType("com.compuserve.gif")) { add(data: gif, ext: "gif"); return }
+        // 3. PNG bytes.
+        if let png = pb.data(forType: .png) { add(data: png, ext: "png"); return }
+        // 4. TIFF / generic image → re-encode to PNG.
+        if let tiff = pb.data(forType: .tiff) ?? NSImage(pasteboard: pb)?.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png, properties: [:]) { add(data: png, ext: "png") }
+    }
+
+    var clipboardHasImage: Bool {
+        let pb = NSPasteboard.general
+        if pb.data(forType: NSPasteboard.PasteboardType("com.compuserve.gif")) != nil { return true }
+        if pb.data(forType: .png) != nil || pb.data(forType: .tiff) != nil { return true }
+        if NSImage(pasteboard: pb) != nil { return true }
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            return urls.contains { Self.imgExts.contains($0.pathExtension.lowercased()) }
+        }
+        return false
+    }
+
+    func copy(_ m: Meme) {
+        let u = url(m); let pb = NSPasteboard.general; pb.clearContents()
+        let item = NSPasteboardItem()
+        if let data = try? Data(contentsOf: u) {
+            switch u.pathExtension.lowercased() {
+            case "gif": item.setData(data, forType: NSPasteboard.PasteboardType("com.compuserve.gif"))
+            case "png": item.setData(data, forType: .png)
+            default: break
+            }
+        }
+        if let img = NSImage(contentsOf: u), let tiff = img.tiffRepresentation { item.setData(tiff, forType: .tiff) }
+        pb.writeObjects([item, u as NSURL])
+    }
+}
+
+// Subsequence fuzzy match with a consecutive-run bonus.
+func memeFuzzy(_ query: String, _ text: String) -> Int? {
+    if query.isEmpty { return 0 }
+    let q = Array(query.lowercased()), t = Array(text.lowercased())
+    var qi = 0, score = 0, last = -2
+    for (ti, c) in t.enumerated() where qi < q.count {
+        if c == q[qi] { score += (ti == last + 1) ? 6 : 1; last = ti; qi += 1 }
+    }
+    return qi == q.count ? score : nil
+}
+
+struct MemeThumb: NSViewRepresentable {
+    let url: URL
+    func makeNSView(context: Context) -> NSImageView {
+        let v = NSImageView()
+        v.imageScaling = .scaleProportionallyUpOrDown      // fit within the cell, keep aspect ratio
+        v.imageAlignment = .alignCenter
+        v.animates = true
+        v.image = NSImage(contentsOf: url)
+        // Don't let the image's natural size dictate layout — let the SwiftUI frame shrink it.
+        v.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        v.setContentHuggingPriority(.defaultLow, for: .vertical)
+        v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        return v
+    }
+    func updateNSView(_ v: NSImageView, context: Context) { v.animates = true }
+}
+
+// AppKit text field that reliably grabs first-responder in Lumo's borderless,
+// non-activating panel (SwiftUI @FocusState doesn't engage there) and reports
+// every keystroke for live filtering.
+struct FocusedTextField: NSViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+    var onSubmit: () -> Void = {}
+
+    func makeNSView(context: Context) -> NSTextField {
+        let tf = NSTextField()
+        tf.placeholderString = placeholder
+        tf.isBordered = false
+        tf.drawsBackground = false
+        tf.focusRingType = .none
+        tf.font = .systemFont(ofSize: 13)
+        tf.textColor = NSColor(Gruv.fg1)
+        tf.delegate = context.coordinator
+        tf.lineBreakMode = .byTruncatingTail
+        DispatchQueue.main.async { tf.window?.makeFirstResponder(tf) }
+        return tf
+    }
+    func updateNSView(_ tf: NSTextField, context: Context) {
+        context.coordinator.parent = self           // keep the binding fresh so edits propagate
+        if tf.stringValue != text { tf.stringValue = text }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: FocusedTextField
+        init(_ p: FocusedTextField) { parent = p }
+        func controlTextDidChange(_ note: Notification) {
+            if let tf = note.object as? NSTextField { parent.text = tf.stringValue }
+        }
+        func control(_ c: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+            if sel == #selector(NSResponder.insertNewline(_:)) { parent.onSubmit(); return true }
+            return false
+        }
+    }
+}
+
+struct MemesTab: View {
+    @ObservedObject var model: MemeLibrary
+    @State private var editText = ""
+
+    private let cols = [GridItem(.adaptive(minimum: 96), spacing: 8)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(Gruv.fg4)
+                FocusedTextField(text: $model.search, placeholder: "Search…  (try “tagthis”)",
+                                 onSubmit: { if let f = model.filtered.first { pick(f) } })
+                Text("\(model.filtered.count)").font(.caption2).foregroundStyle(Gruv.gray)
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Gruv.bg1.opacity(0.6)))
+
+            if model.filtered.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "photo.on.rectangle.angled").font(.title2).foregroundStyle(Gruv.fg4)
+                    Text(model.memes.isEmpty ? "Paste (⌘V) or drag a meme in" : "No match")
+                        .font(.caption).foregroundStyle(Gruv.gray)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: cols, spacing: 8) {
+                        ForEach(model.filtered) { cell($0) }
+                    }.padding(.vertical, 4)
+                }
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { drop($0); return true }
+        .overlay { if let m = model.editingMeme { editorOverlay(m) } }
+    }
+
+    private func cell(_ m: Meme) -> some View {
+        VStack(spacing: 2) {
+            MemeThumb(url: model.url(m))
+                .frame(height: 78).frame(maxWidth: .infinity)
+                .background(Color.black.opacity(0.2))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            Text(m.tags.contains(memeUntagged) ? memeUntagged : m.tags.prefix(2).joined(separator: ", "))
+                .font(.system(size: 10)).lineLimit(1)
+                .foregroundStyle(m.tags.contains(memeUntagged) ? Gruv.yellow : Gruv.gray)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { pick(m) }
+        .help(m.tags.joined(separator: ", "))
+        .contextMenu {
+            Button("Copy") { model.copy(m) }
+            Button("Edit tags…") { startEdit(m) }
+            Divider()
+            Button("Delete", role: .destructive) { model.delete(m) }
+        }
+    }
+
+    private func editorOverlay(_ m: Meme) -> some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea().onTapGesture { model.editingMeme = nil }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Edit tags").font(.headline).foregroundStyle(Gruv.fg1)
+                MemeThumb(url: model.url(m)).frame(height: 110)
+                    .background(Color.black.opacity(0.2)).clipShape(RoundedRectangle(cornerRadius: 6))
+                FocusedTextField(text: $editText, placeholder: "comma, separated, tags", onSubmit: { saveEdit(m) })
+                    .padding(7)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Gruv.bg1.opacity(0.8)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Gruv.fg4.opacity(0.3)))
+                HStack {
+                    Button("Cancel") { model.editingMeme = nil }
+                    Spacer()
+                    Button("Save") { saveEdit(m) }.keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(14).frame(width: 290)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Gruv.bg0))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Gruv.fg4.opacity(0.25)))
+        }
+    }
+
+    private func startEdit(_ m: Meme) {
+        editText = m.tags.filter { $0 != memeUntagged }.joined(separator: ", ")
+        model.editingMeme = m
+    }
+    private func saveEdit(_ m: Meme) {
+        model.setTags(m, editText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
+        model.editingMeme = nil
+    }
+    private func pick(_ m: Meme) {
+        model.copy(m)
+        NotificationCenter.default.post(name: .lumoDismiss, object: nil)
+    }
+
+    private func drop(_ providers: [NSItemProvider]) {
+        for p in providers {
+            p.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                var u: URL?
+                if let d = item as? Data { u = URL(dataRepresentation: d, relativeTo: nil) } else if let x = item as? URL { u = x }
+                guard let u, let data = try? Data(contentsOf: u) else { return }
+                DispatchQueue.main.async { model.add(data: data, ext: u.pathExtension.lowercased()) }
+            }
+        }
+    }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -2842,6 +3255,7 @@ final class PanelController {
     let pi = PiModel()
     let ai = AIModel()
     let system = SystemModel()
+    let memes = MemeLibrary()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -2859,7 +3273,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, weather: weather, events: events, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, pi: pi, ai: ai, system: system))
+        let hosting = NSHostingView(rootView: PanelView(state: state, weather: weather, events: events, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, pi: pi, ai: ai, system: system, memes: memes))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -2900,6 +3314,7 @@ final class PanelController {
         if panel.isVisible && tab == .home { ha.startPolling() } else { ha.stopPolling() }
         if panel.isVisible && tab == .pi { pi.startPolling() } else { pi.stopPolling() }
         if panel.isVisible && tab == .ai { ai.startPolling() } else { ai.stopPolling() }
+        if panel.isVisible && tab == .memes { memes.search = ""; memes.load(); NSApp.activate(ignoringOtherApps: true) }
     }
 
     func toggle(tab: Tab) {
@@ -2945,6 +3360,7 @@ final class PanelController {
         panel.alphaValue = 1
         panel.setFrameOrigin(NSPoint(x: final.x, y: final.y + size.height))   // start fully above
         panel.makeKeyAndOrderFront(nil)
+        if state.tab == .memes { NSApp.activate(ignoringOtherApps: true) }   // text fields need the app active for keyboard focus
         animateOrigin(to: final, duration: 0.34, curve: Self.easeOutBack)
         installMonitors()
         updatePolling(forTab: state.tab)
@@ -2985,7 +3401,16 @@ final class PanelController {
             self?.hide()
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53 { self?.hide(); return nil } // Esc
+            guard let self else { return event }
+            if event.keyCode == 53 {                                            // Esc
+                if self.state.tab == .memes, self.memes.editingMeme != nil { self.memes.editingMeme = nil; return nil }
+                self.hide(); return nil
+            }
+            if self.state.tab == .memes, self.memes.editingMeme == nil,
+               event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "v",
+               self.memes.clipboardHasImage {
+                self.memes.addFromClipboard(); return nil                       // ⌘V adds the clipboard image as a meme
+            }
             return event
         }
     }
