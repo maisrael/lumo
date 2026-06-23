@@ -3427,7 +3427,7 @@ final class ClipboardModel: ObservableObject {
         cap = (cfg["historyCap"] as? Int) ?? 100
         secretTTL = (cfg["secretTTLSeconds"] as? Double) ?? 20
         maxImageBytes = ((cfg["maxImageMB"] as? Int) ?? 5) * 1024 * 1024
-        nvrPath = (cfg["nvrPath"] as? String) ?? (NSHomeDirectory() + "/Library/Python/3.14/bin/nvr")
+        nvrPath = ((cfg["nvrPath"] as? String).map { ($0 as NSString).expandingTildeInPath }) ?? (NSHomeDirectory() + "/Library/Python/3.14/bin/nvr")
         nvimSocket = (cfg["nvimSocket"] as? String) ?? "/tmp/nvimsocket2"
         load()
     }
