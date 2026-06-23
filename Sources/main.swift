@@ -249,11 +249,31 @@ struct WorldCity: Identifiable {
     var tz: TimeZone { TimeZone(identifier: tzID)! }
 }
 
-let worldCities: [WorldCity] = [
-    WorldCity(name: "Helsinki",     tzID: "Europe/Helsinki",     lat: 60.1699, lon: 24.9384),
-    WorldCity(name: "Kuala Lumpur", tzID: "Asia/Kuala_Lumpur",   lat:  3.1390, lon: 101.6869),
-    WorldCity(name: "Málaga",       tzID: "Europe/Madrid",       lat: 36.7213, lon: -4.4214),
-]
+// calendar.json (optional): { "homeTimezone": "...", "cities": [{name,tz,lat,lon}…] }
+// Missing/partial → these defaults. (ponytail: parse-with-defaults, no Codable ceremony.)
+private let calendarCfg: [String: Any] = {
+    guard let d = try? Data(contentsOf: URL(fileURLWithPath: lumoConfigDir + "/calendar.json")),
+          let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return [:] }
+    return j
+}()
+
+let homeTZ = (calendarCfg["homeTimezone"] as? String).flatMap(TimeZone.init(identifier:))
+    ?? TimeZone(identifier: "Europe/Helsinki") ?? .current
+
+let worldCities: [WorldCity] = {
+    let defaults = [
+        WorldCity(name: "Helsinki",     tzID: "Europe/Helsinki",   lat: 60.1699, lon: 24.9384),
+        WorldCity(name: "Kuala Lumpur", tzID: "Asia/Kuala_Lumpur", lat:  3.1390, lon: 101.6869),
+        WorldCity(name: "Málaga",       tzID: "Europe/Madrid",     lat: 36.7213, lon: -4.4214),
+    ]
+    guard let arr = calendarCfg["cities"] as? [[String: Any]] else { return defaults }
+    let parsed = arr.compactMap { d -> WorldCity? in
+        guard let n = d["name"] as? String, let tz = d["tz"] as? String,
+              let la = d["lat"] as? Double, let lo = d["lon"] as? Double else { return nil }
+        return WorldCity(name: n, tzID: tz, lat: la, lon: lo)
+    }
+    return parsed.isEmpty ? defaults : parsed
+}()
 
 // MARK: - Weather (Open-Meteo, no API key — one request for all clock cities)
 
@@ -418,7 +438,7 @@ struct EventsList: View {
     private func when(_ e: CalEvent) -> String {
         let cal = Calendar.current
         let f = DateFormatter()
-        f.timeZone = TimeZone(identifier: "Europe/Helsinki")
+        f.timeZone = homeTZ
         if e.allDay {
             f.dateFormat = cal.isDateInToday(e.start) ? "'Today · all day'" : "EEE d · 'all day'"
             return f.string(from: e.start)
@@ -437,7 +457,7 @@ struct CalendarTab: View {
     private var today: String {
         let f = DateFormatter()
         f.dateFormat = "EEEE, d MMMM"
-        f.timeZone = TimeZone(identifier: "Europe/Helsinki")
+        f.timeZone = homeTZ
         return f.string(from: Date())
     }
 
@@ -461,7 +481,7 @@ struct MiniCalendar: View {
     private var cal: Calendar {
         var c = Calendar(identifier: .gregorian)
         c.firstWeekday = 2 // Monday
-        c.timeZone = TimeZone(identifier: "Europe/Helsinki")!
+        c.timeZone = homeTZ
         return c
     }
     private let weekdays = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
@@ -507,7 +527,7 @@ struct MiniCalendar: View {
 
 struct WorldClocksView: View {
     @ObservedObject var weather: WeatherModel
-    private let home = TimeZone(identifier: "Europe/Helsinki")!
+    private let home = homeTZ
 
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 1)) { ctx in
@@ -2523,10 +2543,15 @@ final class AIModel: ObservableObject {
     @Published var localRequestsToday = 0
 
     private var omlxKey = ""
+    private let omlxBase: String
     private var timer: Timer?
     private var lastClaude = Date.distantPast
 
     init() {
+        // ai.json (optional): { "omlxURL": "http://host:port" }
+        let cfg = (try? Data(contentsOf: URL(fileURLWithPath: lumoConfigDir + "/ai.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        omlxBase = (cfg["omlxURL"] as? String) ?? "http://127.0.0.1:8000"
         if let data = FileManager.default.contents(atPath: NSHomeDirectory() + "/.omlx/settings.json"),
            let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let auth = j["auth"] as? [String: Any] {
@@ -2547,10 +2572,10 @@ final class AIModel: ObservableObject {
     }
     func stopPolling() { timer?.invalidate(); timer = nil }
 
-    func openDashboard() { AppLauncher.openURL("http://127.0.0.1:8000/admin") }
+    func openDashboard() { AppLauncher.openURL(omlxBase + "/admin") }
 
     private func refreshOMLX() {
-        guard let url = URL(string: "http://127.0.0.1:8000/v1/models") else { return }
+        guard let url = URL(string: omlxBase + "/v1/models") else { return }
         var req = URLRequest(url: url, timeoutInterval: 3)
         if !omlxKey.isEmpty { req.setValue("Bearer \(omlxKey)", forHTTPHeaderField: "Authorization") }
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
@@ -3364,9 +3389,11 @@ final class ClipboardModel: ObservableObject {
     private let indexURL: URL
     private var lastChange = NSPasteboard.general.changeCount
     private var timer: Timer?
-    private let cap = 100
-    private let secretTTL: TimeInterval = 20
-    private let maxImageBytes = 5 * 1024 * 1024
+    private let cap: Int
+    private let secretTTL: TimeInterval
+    private let maxImageBytes: Int
+    private let nvrPath: String
+    private let nvimSocket: String
 
     private static let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
     private static let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
@@ -3378,6 +3405,14 @@ final class ClipboardModel: ObservableObject {
         filesDir = base.appendingPathComponent("files")
         indexURL = base.appendingPathComponent("index.json")
         try? FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+        // clipboard.json (optional): historyCap, secretTTLSeconds, maxImageMB, nvrPath, nvimSocket
+        let cfg = (try? Data(contentsOf: URL(fileURLWithPath: lumoConfigDir + "/clipboard.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        cap = (cfg["historyCap"] as? Int) ?? 100
+        secretTTL = (cfg["secretTTLSeconds"] as? Double) ?? 20
+        maxImageBytes = ((cfg["maxImageMB"] as? Int) ?? 5) * 1024 * 1024
+        nvrPath = (cfg["nvrPath"] as? String) ?? (NSHomeDirectory() + "/Library/Python/3.14/bin/nvr")
+        nvimSocket = (cfg["nvimSocket"] as? String) ?? "/tmp/nvimsocket2"
         load()
     }
 
@@ -3502,11 +3537,11 @@ final class ClipboardModel: ObservableObject {
     // Text → a new nvim tab (replaces Hammerspoon Hyper+V).
     func pasteToVim(_ it: ClipItem) {
         guard it.kind == .text, let text = it.text else { return }
-        let sock = "/tmp/nvimsocket2"
+        let sock = nvimSocket
         guard FileManager.default.fileExists(atPath: sock) else { return }
         let tmp = NSTemporaryDirectory() + "lumo-clip-\(UUID().uuidString.prefix(6)).txt"
         try? text.write(toFile: tmp, atomically: true, encoding: .utf8)
-        let nvr = NSHomeDirectory() + "/Library/Python/3.14/bin/nvr"
+        let nvr = nvrPath
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = ["-lc", "'\(nvr)' --servername '\(sock)' --remote-tab-silent '\(tmp)'"]
