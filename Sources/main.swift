@@ -12,6 +12,11 @@ import EventKit
 import UniformTypeIdentifiers
 import ApplicationServices   // Accessibility API (AXUIElement) for quake window control
 
+// Per-install config dir: "lumo" for the real app, "lumo-dev" for the dev build,
+// so the two never share state. (ponytail: one derived constant, no flag.)
+let lumoConfigDir = NSHomeDirectory() + "/.config/"
+    + ((Bundle.main.bundleIdentifier?.hasSuffix(".dev") ?? false) ? "lumo-dev" : "lumo")
+
 // MARK: - Gruvbox palette
 
 enum Gruv {
@@ -1815,7 +1820,7 @@ final class UniFiModel: NSObject, ObservableObject, URLSessionDelegate {
     }
 
     private func loadConfig() {
-        let path = NSHomeDirectory() + "/.config/lumo/unifi.json"
+        let path = lumoConfigDir + "/unifi.json"
         guard let data = FileManager.default.contents(atPath: path),
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             configured = false; return
@@ -2075,7 +2080,7 @@ final class HAModel: NSObject, ObservableObject, URLSessionDelegate {
     }
 
     private func loadConfig() {
-        let path = NSHomeDirectory() + "/.config/lumo/ha.json"
+        let path = lumoConfigDir + "/ha.json"
         guard let data = FileManager.default.contents(atPath: path),
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { configured = false; return }
         url = (j["url"] as? String ?? "").trimmingCharacters(in: .whitespaces)
@@ -2744,7 +2749,7 @@ final class PiModel: ObservableObject {
     }
 
     private func loadConfig() {
-        let path = NSHomeDirectory() + "/.config/lumo/pi.json"
+        let path = lumoConfigDir + "/pi.json"
         guard let data = FileManager.default.contents(atPath: path),
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             configured = false; return
@@ -3065,7 +3070,7 @@ final class MemeLibrary: ObservableObject {
     }
 
     init() {
-        let base = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/lumo/memes")
+        let base = URL(fileURLWithPath: lumoConfigDir).appendingPathComponent("memes")
         filesDir = base.appendingPathComponent("files")
         trashDir = base.appendingPathComponent("trash")
         indexURL = base.appendingPathComponent("index.json")
@@ -3369,7 +3374,7 @@ final class ClipboardModel: ObservableObject {
     private static let imgExts: Set<String> = ["gif", "png", "jpg", "jpeg", "webp", "heic"]
 
     init() {
-        let base = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/lumo/clipboard")
+        let base = URL(fileURLWithPath: lumoConfigDir).appendingPathComponent("clipboard")
         filesDir = base.appendingPathComponent("files")
         indexURL = base.appendingPathComponent("index.json")
         try? FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)

@@ -4,8 +4,9 @@ EXEC     := $(BUNDLE)/Contents/MacOS/$(APP)
 PLIST    := $(BUNDLE)/Contents/Info.plist
 LSREG    := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 SIGN_ID  := Lumo Self-Signed
+DEV_APP  := Lumo Dev.app
 
-.PHONY: build run install reload clean
+.PHONY: build run install reload dev clean
 
 # Sign every build with a stable self-signed identity so macOS TCC grants
 # (Spotify automation, Bluetooth, Location) persist across rebuilds.
@@ -35,6 +36,21 @@ install: build
 	@$(LSREG) -f /Applications/$(BUNDLE) 2>/dev/null || true
 	@echo "Installed to /Applications/$(BUNDLE)"
 
+# Parallel dev build: separate bundle id / exec / URL scheme / config dir so it
+# runs alongside the installed daily driver without clobbering it. No LaunchAgent.
+dev:
+	@mkdir -p "$(DEV_APP)/Contents/MacOS"
+	swiftc -O -swift-version 5 Sources/*.swift -o "$(DEV_APP)/Contents/MacOS/Lumo Dev"
+	@sed -e 's#<string>Lumo</string>#<string>Lumo Dev</string>#g' \
+	     -e 's#fi\.mangusti\.lumo#fi.mangusti.lumo.dev#g' \
+	     -e 's#<string>lumo</string>#<string>lumodev</string>#g' \
+	     Info.plist > "$(DEV_APP)/Contents/Info.plist"
+	@codesign --force --sign "$(SIGN_ID)" "$(DEV_APP)"
+	@$(LSREG) -f "$(DEV_APP)" 2>/dev/null || true
+	@killall "Lumo Dev" 2>/dev/null || true
+	@open "$(DEV_APP)"
+	@echo "Lumo Dev running — bundle fi.mangusti.lumo.dev · scheme lumodev:// · config ~/.config/lumo-dev/"
+
 clean:
-	@rm -rf $(BUNDLE)
+	@rm -rf $(BUNDLE) "$(DEV_APP)"
 	@echo "cleaned"
