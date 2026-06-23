@@ -4105,6 +4105,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelega
             if (url.pathComponents.last ?? "") == "prev" { controller.clipboard.copyPrevious() }
             return
         }
+        if url.host == "hide" {   // lumo://hide — close the panel (e.g. from Hammerspoon Hyper+V)
+            NotificationCenter.default.post(name: .lumoDismiss, object: nil)
+            return
+        }
         // Accept both  lumo://tab/calendar  and  lumo://calendar
         let raw = (url.host == "tab" ? url.pathComponents.last : url.host) ?? ""
         let name = raw.lowercased()
