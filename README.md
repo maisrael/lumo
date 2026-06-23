@@ -1,13 +1,15 @@
 # Lumo
 
+> ⚠️ **100% vibe-coded — use at your own risk.** Built almost entirely by AI pair-programming (Claude Code). No warranty, no guarantees; it may misbehave or eat your config. Read the code before you run it.
+
 A Noctalia-inspired drop-down control center for macOS: **one translucent, Gruvbox-themed window with everything on tabs**, summoned pre-switched to whichever tab you ask for. Pure `swiftc` + a Makefile — **no Xcode**. Runs as an `LSUIElement` agent (no dock icon).
 
-12 tabs. Some work for anyone; some expect the author's home-lab and just show a "No config" hint until you point them at your own services:
+14 tabs. Some work for anyone; some expect the author's home-lab and just show a "No config" hint until you point them at your own services:
 
-- **Universal:** Calendar (world clocks + weather + events), Timer, Now Playing (Spotify), Sound, Power, Network, System.
+- **Universal:** Calendar (world clocks + weather + events), Timer, Now Playing (Spotify), Sound, Power, Network, System, Memes, Clipboard.
 - **Needs your own backend (optional):** UniFi, Home (Home Assistant), Pi (a small health container), VPN, AI (a local oMLX server).
 
-> ⚠️ It's a personal tool, not a polished product. There's **no menu-bar icon or hotkey built in** — the panel is opened via `lumo://tab/<name>` URLs (the author triggers them from sketchybar). Getting it running on a fresh Mac means building it, sorting out code-signing, wiring up a way to summon it, and personalizing a few hardcoded bits. The prompt below hands all of that to Claude Code.
+> ⚠️ It's a personal tool, not a polished product. It has a **built-in menu-bar icon** (plus `lumo://tab/<name>` URLs) to summon the panel, and reads optional per-module config from `~/.config/lumo/` (see `config-examples/`). Getting it running on a fresh Mac still means building it and sorting out code-signing. The prompt below hands all of that to Claude Code.
 
 ---
 
@@ -42,7 +44,7 @@ have the author's home-lab.
 3. A WAY TO OPEN IT — there is NO built-in menu-bar icon or hotkey; the app is only
    summoned via `lumo://tab/<name>` URLs. Ask me how I want to trigger it and set it
    up:
-   - If I run sketchybar: add click_scripts like `open 'lumo://tab/calendar'`.
+   - If I run [sketchybar](https://github.com/FelixKratz/SketchyBar): add click_scripts like `open 'lumo://tab/calendar'`.
    - Otherwise, offer me a choice and implement it: a global hotkey (skhd /
      Hammerspoon / Raycast / macOS Shortcuts), OR add a small NSStatusItem menu-bar
      button to Sources/main.swift that toggles the panel (good default for a normal
@@ -93,7 +95,7 @@ open "lumo://tab/calendar"      # or music, sound, power, network, timer, system
 ```
 
 - **Signing:** the Makefile signs with `SIGN_ID := Lumo Self-Signed`. Create your own cert by that name, or set `SIGN_ID := -` for ad-hoc signing.
-- **Open it:** wire `open 'lumo://tab/<name>'` to a hotkey, a sketchybar item, or add a menu-bar button. Re-firing the same tab toggles it closed; click outside or press `Esc` to dismiss.
+- **Open it:** wire `open 'lumo://tab/<name>'` to a hotkey, a [sketchybar](https://github.com/FelixKratz/SketchyBar) item, or add a menu-bar button. Re-firing the same tab toggles it closed; click outside or press `Esc` to dismiss.
 - **Personalize:** edit `worldCities` and the home timezone in `Sources/main.swift`.
 - **Optional configs:** `~/.config/lumo/{unifi,ha,pi}.json` (mode 600). Absent = that tab shows "No config".
 
