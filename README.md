@@ -1,4 +1,6 @@
-# Lumo
+<p align="center">
+  <img src="assets/lumo-banner.png" alt="Lumo" width="660">
+</p>
 
 > ⚠️ **100% vibe-coded — use at your own risk.** Built almost entirely by AI pair-programming (Claude Code). No warranty, no guarantees; it may misbehave or eat your config. Read the code before you run it.
 

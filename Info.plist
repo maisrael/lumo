@@ -10,6 +10,8 @@
     <string>fi.mangusti.lumo</string>
     <key>CFBundleExecutable</key>
     <string>Lumo</string>
+    <key>CFBundleIconFile</key>
+    <string>Lumo</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

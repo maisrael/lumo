@@ -11,6 +11,7 @@ DEV_APP  := Lumo Dev.app
 # Sign every build with a stable self-signed identity so macOS TCC grants
 # (Spotify automation, Bluetooth, Location) persist across rebuilds.
 build: $(EXEC) $(PLIST)
+	@mkdir -p $(BUNDLE)/Contents/Resources && cp assets/Lumo.icns $(BUNDLE)/Contents/Resources/Lumo.icns
 	@codesign --force --sign "$(SIGN_ID)" $(BUNDLE) && echo "[codesign] $(BUNDLE) signed with '$(SIGN_ID)'"
 
 $(EXEC): Sources/*.swift
