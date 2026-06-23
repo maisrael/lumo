@@ -91,6 +91,16 @@ enum Tab: String, CaseIterable, Identifiable {
     }
 }
 
+// config.json (optional): { "enabledModules": ["calendar","clipboard",…] } — same
+// names as lumo://tab/<name>. Missing/empty → all modules enabled.
+let enabledModules: Set<Tab> = {
+    guard let d = try? Data(contentsOf: URL(fileURLWithPath: lumoConfigDir + "/config.json")),
+          let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+          let names = j["enabledModules"] as? [String] else { return Set(Tab.allCases) }
+    let tabs = names.compactMap { Tab(rawValue: $0.lowercased()) }
+    return tabs.isEmpty ? Set(Tab.allCases) : Set(tabs)
+}()
+
 // MARK: - Launch another app + dismiss the panel
 
 extension Notification.Name {
@@ -122,7 +132,7 @@ enum AppLauncher {
 // MARK: - Shared state
 
 final class PanelState: ObservableObject {
-    @Published var tab: Tab = .calendar
+    @Published var tab: Tab = Tab.allCases.first { enabledModules.contains($0) } ?? .calendar
 }
 
 // MARK: - SwiftUI content
@@ -158,7 +168,7 @@ struct PanelView: View {
 
     private var rail: some View {
         VStack(spacing: 1) {                       // tightened from 3 to fit 14 tabs
-            ForEach(Tab.allCases) { t in
+            ForEach(Tab.allCases.filter { enabledModules.contains($0) }) { t in
                 RailIcon(tab: t, isActive: state.tab == t) { state.tab = t }
             }
             Spacer()
@@ -3743,7 +3753,7 @@ final class PanelController {
             .sink { [weak self] tab in self?.updatePolling(forTab: tab) }
             .store(in: &cancellables)
 
-        clipboard.startMonitoring()   // clipboard history runs for the whole app lifetime, not tab-scoped
+        if enabledModules.contains(.clipboard) { clipboard.startMonitoring() }   // app-lifetime monitor, only if enabled
     }
 
     private func updatePolling(forTab tab: Tab) {
