@@ -13,6 +13,12 @@ A Noctalia-inspired drop-down control center for macOS: **one translucent, Gruvb
 
 > ⚠️ It's a personal tool, not a polished product. It has a **built-in menu-bar icon** (plus `lumo://tab/<name>` URLs) to summon the panel, and reads optional per-module config from `~/.config/lumo/` (see `config-examples/`). Getting it running on a fresh Mac still means building it and sorting out code-signing. The prompt below hands all of that to Claude Code.
 
+## Screenshots
+
+<p align="center">
+  <img src="assets/lumo-screenshots.png" alt="Lumo tabs — Calendar, Now Playing, Sound, AI, Power, System" width="840">
+</p>
+
 ---
 
 ## 🟢 Install it with Claude Code (copy-paste this)
