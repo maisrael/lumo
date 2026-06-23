@@ -3399,7 +3399,8 @@ struct ClipItem: Identifiable, Codable {
 
 final class ClipboardModel: ObservableObject {
     @Published var items: [ClipItem] = []
-    @Published var search = ""
+    @Published var search = "" { didSet { sel = 0 } }
+    @Published var sel = 0          // ↑/↓ highlighted index into `filtered`
 
     private let filesDir: URL
     private let indexURL: URL
@@ -3591,6 +3592,16 @@ final class ClipboardModel: ObservableObject {
             .sorted { $0.1 > $1.1 }
             .map { $0.0 }
     }
+
+    var selectedItem: ClipItem? {
+        let f = filtered
+        return f.indices.contains(sel) ? f[sel] : f.first
+    }
+    func move(_ d: Int) {
+        let n = filtered.count
+        guard n > 0 else { return }
+        sel = max(0, min(n - 1, sel + d))
+    }
 }
 
 struct ClipboardTab: View {
@@ -3601,11 +3612,12 @@ struct ClipboardTab: View {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(Gruv.fg4)
                 FocusedTextField(text: $model.search, placeholder: "Search clipboard…",
-                                 onSubmit: { if let f = model.filtered.first { pick(f) } })
+                                 onSubmit: { if let it = model.selectedItem { pick(it) } })
                 Text("\(model.filtered.count)").font(.caption2).foregroundStyle(Gruv.gray)
             }
             .padding(8)
             .background(RoundedRectangle(cornerRadius: 8).fill(Gruv.bg1.opacity(0.6)))
+            .onAppear { model.sel = 0 }
 
             if model.filtered.isEmpty {
                 VStack(spacing: 6) {
@@ -3614,10 +3626,17 @@ struct ClipboardTab: View {
                         .font(.caption).foregroundStyle(Gruv.gray)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(model.filtered) { row($0) }
-                    }.padding(.vertical, 2)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 4) {
+                            ForEach(model.filtered) { row($0) }
+                        }.padding(.vertical, 2)
+                    }
+                    .onChange(of: model.sel) { _, _ in
+                        if let id = model.selectedItem?.id {
+                            withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id, anchor: .center) }
+                        }
+                    }
                 }
             }
         }
@@ -3650,7 +3669,8 @@ struct ClipboardTab: View {
         }
         .padding(.vertical, 5).padding(.horizontal, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Gruv.bg1.opacity(0.35)))
+        .background(RoundedRectangle(cornerRadius: 6).fill(it.id == model.selectedItem?.id ? Gruv.yellow.opacity(0.18) : Gruv.bg1.opacity(0.35)))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(it.id == model.selectedItem?.id ? Gruv.yellow.opacity(0.7) : .clear, lineWidth: 1))
         .contentShape(Rectangle())
         .onTapGesture { pick(it) }
         .contextMenu {
@@ -3872,6 +3892,10 @@ final class PanelController {
                event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "v",
                self.memes.clipboardHasImage {
                 self.memes.addFromClipboard(); return nil                       // ⌘V adds the clipboard image as a meme
+            }
+            if self.state.tab == .clipboard {                                   // ↑/↓ move the clipboard selection
+                if event.keyCode == 126 { self.clipboard.move(-1); return nil }
+                if event.keyCode == 125 { self.clipboard.move(1);  return nil }
             }
             return event
         }
