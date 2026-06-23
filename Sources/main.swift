@@ -10,6 +10,7 @@ import CoreWLAN
 import CoreLocation
 import EventKit
 import UniformTypeIdentifiers
+import ApplicationServices   // Accessibility API (AXUIElement) for quake window control
 
 // MARK: - Gruvbox palette
 
@@ -42,7 +43,7 @@ extension Color {
 // MARK: - Tabs
 
 enum Tab: String, CaseIterable, Identifiable {
-    case calendar, timer, music, sound, power, network, unifi, vpn, home, pi, ai, system, memes
+    case calendar, timer, music, sound, power, network, unifi, vpn, home, pi, ai, system, memes, clipboard
 
     var id: String { rawValue }
 
@@ -56,11 +57,12 @@ enum Tab: String, CaseIterable, Identifiable {
         case .network:  return "Network"
         case .unifi:    return "UniFi"
         case .vpn:      return "VPN"
-        case .home:     return "Home"
+        case .home:     return "Smart Home"
         case .pi:       return "Pi"
         case .ai:       return "AI"
         case .system:   return "System"
         case .memes:    return "Memes"
+        case .clipboard: return "Clipboard"
         }
     }
 
@@ -79,6 +81,7 @@ enum Tab: String, CaseIterable, Identifiable {
         case .ai:       return "sparkles"
         case .system:   return "slider.horizontal.3"
         case .memes:    return "photo.stack"
+        case .clipboard: return "doc.on.clipboard"
         }
     }
 }
@@ -136,6 +139,7 @@ struct PanelView: View {
     @ObservedObject var ai: AIModel
     @ObservedObject var system: SystemModel
     @ObservedObject var memes: MemeLibrary
+    @ObservedObject var clipboard: ClipboardModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -148,13 +152,13 @@ struct PanelView: View {
     }
 
     private var rail: some View {
-        VStack(spacing: 3) {
+        VStack(spacing: 1) {                       // tightened from 3 to fit 14 tabs
             ForEach(Tab.allCases) { t in
                 RailIcon(tab: t, isActive: state.tab == t) { state.tab = t }
             }
             Spacer()
         }
-        .padding(.vertical, 14)
+        .padding(.vertical, 8)
         .padding(.horizontal, 9)
         .frame(width: 60)
     }
@@ -183,6 +187,7 @@ struct PanelView: View {
                 case .ai:       AITab(model: ai)
                 case .system:   SystemTab(model: system)
                 case .memes:    MemesTab(model: memes)
+                case .clipboard: ClipboardTab(model: clipboard)
                 }
             }
             .padding(.horizontal, 18)
@@ -2046,7 +2051,7 @@ struct HAEntity: Identifiable {
     let name: String
     var state: String
     var unit: String
-    var currentTemp: Double?
+    var targetTemp: Double?   // climate setpoint (attr "temperature"), not the measured temp
 }
 
 final class HAModel: NSObject, ObservableObject, URLSessionDelegate {
@@ -2089,11 +2094,16 @@ final class HAModel: NSObject, ObservableObject, URLSessionDelegate {
     func refresh() { guard configured else { return }; Task { [weak self] in await self?.load() } }
 
     func toggle(_ e: HAEntity) {
-        guard e.domain == "light" || e.domain == "switch" else { return }
+        let service: String
+        if e.domain == "lock" {
+            service = (e.state == "locked") ? "unlock" : "lock"
+        } else if e.domain == "light" || e.domain == "switch" {
+            service = "toggle"
+        } else { return }
         busy.insert(e.entityId)
         Task { [weak self] in
             guard let self else { return }
-            await self.callService(domain: e.domain, service: "toggle", entity: e.entityId)
+            await self.callService(domain: e.domain, service: service, entity: e.entityId)
             try? await Task.sleep(nanoseconds: 400_000_000)
             await self.load()
             await MainActor.run { self.busy.remove(e.entityId) }
@@ -2115,8 +2125,8 @@ final class HAModel: NSObject, ObservableObject, URLSessionDelegate {
                              name: attrs["friendly_name"] as? String ?? id,
                              state: s["state"] as? String ?? "",
                              unit: attrs["unit_of_measurement"] as? String ?? "",
-                             currentTemp: attrs["current_temperature"] as? Double)
-            if e.domain == "light" || e.domain == "switch" { lts.append(e) } else { sns.append(e) }
+                             targetTemp: attrs["temperature"] as? Double)
+            if e.domain == "light" || e.domain == "switch" || e.domain == "lock" { lts.append(e) } else { sns.append(e) }
         }
         await MainActor.run { self.lights = lts; self.sensors = sns; self.reachable = true }
     }
@@ -2149,6 +2159,99 @@ final class HAModel: NSObject, ObservableObject, URLSessionDelegate {
     }
 }
 
+/// Front-door lock row. Locking is a single tap (no risk); UNLOCKING requires a
+/// press-and-hold that fills a capsule over ~1.1s, so it can't fire from a stray tap.
+struct LockRow: View {
+    @ObservedObject var model: HAModel
+    let entity: HAEntity
+    @State private var progress: CGFloat = 0
+    @State private var holding = false
+    @State private var work: DispatchWorkItem?
+
+    private let pillW: CGFloat = 124
+    private let pillH: CGFloat = 26
+    private let holdDuration = 1.1
+
+    var body: some View {
+        let locked = entity.state == "locked"
+        let off = entity.state == "unavailable" || entity.state == "unknown"
+        let busy = model.busy.contains(entity.entityId)
+        return HStack(spacing: 10) {
+            Image(systemName: locked ? "lock.fill" : "lock.open.fill")
+                .frame(width: 20)
+                .foregroundStyle(off ? Gruv.fg4 : (locked ? Gruv.green : Gruv.red))
+            Text(entity.name).foregroundStyle(off ? Gruv.fg4 : Gruv.fg1).lineLimit(1)
+            Spacer()
+            if busy {
+                ProgressView().controlSize(.small).frame(width: pillW, alignment: .trailing)
+            } else if off {
+                Text("unavailable").font(.caption2).foregroundStyle(Gruv.gray)
+            } else if locked {
+                holdToUnlock
+            } else {
+                lockButton
+            }
+        }
+        .font(.callout)
+        .padding(.vertical, 5)
+    }
+
+    private var holdToUnlock: some View {
+        ZStack(alignment: .leading) {
+            Capsule().fill(Gruv.bg1)
+            Capsule().fill(Gruv.yellow).frame(width: progress * pillW)
+            HStack(spacing: 5) {
+                Image(systemName: "lock.open.fill").font(.caption2)
+                Text(holding ? "Keep holding…" : "Hold to unlock")
+                    .font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(progress > 0.45 ? Gruv.bg0 : Gruv.fg2)
+            .frame(width: pillW, height: pillH)
+        }
+        .frame(width: pillW, height: pillH)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Gruv.bg3, lineWidth: 1))
+        .contentShape(Capsule())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in beginHold() }
+                .onEnded { _ in cancelHold() }
+        )
+    }
+
+    private var lockButton: some View {
+        Button { model.toggle(entity) } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "lock.fill").font(.caption2)
+                Text("Lock").font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(Gruv.bg0)
+            .frame(width: pillW, height: pillH)
+            .background(Capsule().fill(Gruv.green))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func beginHold() {
+        guard !holding else { return }   // onChanged repeats; only arm once per press
+        holding = true
+        withAnimation(.linear(duration: holdDuration)) { progress = 1 }
+        let w = DispatchWorkItem {
+            model.toggle(entity)   // state is "locked" here → sends unlock
+            holding = false
+            progress = 0
+        }
+        work = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + holdDuration, execute: w)
+    }
+
+    private func cancelHold() {
+        work?.cancel(); work = nil
+        holding = false
+        withAnimation(.easeOut(duration: 0.18)) { progress = 0 }
+    }
+}
+
 struct HATab: View {
     @ObservedObject var model: HAModel
 
@@ -2162,8 +2265,10 @@ struct HATab: View {
                 VStack(alignment: .leading, spacing: 16) {
                     if !model.lights.isEmpty {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Lights").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
-                            ForEach(model.lights) { lightRow($0) }
+                            Text("Home").font(.caption.weight(.semibold)).foregroundStyle(Gruv.yellow)
+                            ForEach(model.lights) { e in
+                                if e.domain == "lock" { LockRow(model: model, entity: e) } else { lightRow(e) }
+                            }
                         }
                     }
                     if !model.sensors.isEmpty {
@@ -2222,7 +2327,7 @@ struct HATab: View {
 
     private func value(_ e: HAEntity) -> String {
         if e.domain == "climate" {
-            let t = e.currentTemp.map { String(format: "%.0f°", $0) } ?? ""
+            let t = e.targetTemp.map { String(format: "%.0f°", $0) } ?? ""
             return "\(e.state.capitalized) \(t)".trimmingCharacters(in: .whitespaces)
         }
         let u = e.unit.isEmpty ? "" : " \(e.unit)"
@@ -3226,6 +3331,293 @@ struct MemesTab: View {
     }
 }
 
+// MARK: - Clipboard tab (replaces Maccy + Hammerspoon Hyper+V)
+//
+// App-lifetime clipboard monitor: polls NSPasteboard.changeCount every 0.5s (the
+// only way — macOS has no clipboard-change event). Text + image history, newest
+// first, capped at 100 (non-secret). Concealed copies (1Password passwords, marked
+// org.nspasteboard.ConcealedType) go to an in-memory "secret" lane with a 20s TTL —
+// pasteable briefly, never written to disk. Select → copies back (you paste).
+// Text items also have a → vim action (nvr), porting Hammerspoon's Hyper+V.
+
+struct ClipItem: Identifiable, Codable {
+    enum Kind: String, Codable { case text, image }
+    var id = UUID()
+    var kind: Kind
+    var text: String?
+    var file: String?            // image filename in files/
+    var added = Date()
+    var secret = false           // concealed → ephemeral, RAM-only
+    var expiresAt: Date?         // set for secret items
+}
+
+final class ClipboardModel: ObservableObject {
+    @Published var items: [ClipItem] = []
+    @Published var search = ""
+
+    private let filesDir: URL
+    private let indexURL: URL
+    private var lastChange = NSPasteboard.general.changeCount
+    private var timer: Timer?
+    private let cap = 100
+    private let secretTTL: TimeInterval = 20
+    private let maxImageBytes = 5 * 1024 * 1024
+
+    private static let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+    private static let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+    private static let gifType   = NSPasteboard.PasteboardType("com.compuserve.gif")
+    private static let imgExts: Set<String> = ["gif", "png", "jpg", "jpeg", "webp", "heic"]
+
+    init() {
+        let base = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/lumo/clipboard")
+        filesDir = base.appendingPathComponent("files")
+        indexURL = base.appendingPathComponent("index.json")
+        try? FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+        load()
+    }
+
+    func fileURL(_ name: String) -> URL { filesDir.appendingPathComponent(name) }
+
+    // Runs for the whole app lifetime (NOT tab-scoped) — you copy things all day,
+    // then open Lumo to retrieve. Started once from PanelController.init.
+    func startMonitoring() {
+        guard timer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func tick() {
+        pruneExpired()
+        let pb = NSPasteboard.general
+        guard pb.changeCount != lastChange else { return }
+        lastChange = pb.changeCount
+        capture(pb)
+    }
+
+    private func pruneExpired() {
+        let now = Date()
+        if items.contains(where: { ($0.expiresAt ?? .distantFuture) < now }) {
+            items.removeAll { ($0.expiresAt ?? .distantFuture) < now }
+        }
+    }
+
+    private func capture(_ pb: NSPasteboard) {
+        let types = pb.types ?? []
+        if types.contains(Self.transient) { return }          // honor the no-store opt-out
+        let secret = types.contains(Self.concealed)
+
+        // Image first (passwords are concealed text, never images).
+        if let (data, ext) = imageData(pb) {
+            guard data.count <= maxImageBytes else { return }
+            let name = "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6)).\(ext)"
+            try? data.write(to: fileURL(name))
+            insert(ClipItem(kind: .image, file: name))
+            return
+        }
+        if let s = pb.string(forType: .string), !s.isEmpty {
+            if s.hasPrefix("lumo://") { return }               // never store our own control URLs
+            if items.first?.text == s { return }               // dedup consecutive
+            var it = ClipItem(kind: .text, text: s, secret: secret)
+            if secret { it.expiresAt = Date().addingTimeInterval(secretTTL) }
+            insert(it)
+        }
+    }
+
+    private func imageData(_ pb: NSPasteboard) -> (Data, String)? {
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let u = urls.first(where: { Self.imgExts.contains($0.pathExtension.lowercased()) }),
+           let d = try? Data(contentsOf: u) { return (d, u.pathExtension.lowercased()) }
+        if let gif = pb.data(forType: Self.gifType) { return (gif, "gif") }
+        if let png = pb.data(forType: .png) { return (png, "png") }
+        if let tiff = pb.data(forType: .tiff) ?? NSImage(pasteboard: pb)?.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png, properties: [:]) { return (png, "png") }
+        return nil
+    }
+
+    private func insert(_ it: ClipItem) {
+        items.insert(it, at: 0)
+        var normal = 0
+        items = items.filter { item in
+            if item.expiresAt != nil { return true }           // secrets self-expire, exempt from cap
+            normal += 1
+            if normal > cap {
+                if item.kind == .image, let f = item.file { try? FileManager.default.removeItem(at: fileURL(f)) }
+                return false
+            }
+            return true
+        }
+        persist()
+    }
+
+    // Write an item to the pasteboard. Suppress re-capture of our own write —
+    // critical for secrets, else the plain re-copy would be stored to disk.
+    private func writePasteboard(_ it: ClipItem) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        switch it.kind {
+        case .text:
+            if let t = it.text { pb.setString(t, forType: .string) }
+        case .image:
+            if let f = it.file, let data = try? Data(contentsOf: fileURL(f)) {
+                let item = NSPasteboardItem()
+                if (f as NSString).pathExtension.lowercased() == "gif" { item.setData(data, forType: Self.gifType) }
+                else { item.setData(data, forType: .png) }
+                if let img = NSImage(data: data), let tiff = img.tiffRepresentation { item.setData(tiff, forType: .tiff) }
+                pb.writeObjects([item])
+            }
+        }
+        lastChange = pb.changeCount
+    }
+
+    // Copies an item back to the pasteboard (you paste) and floats it to the top,
+    // so the list always reflects what's currently on the clipboard.
+    func select(_ it: ClipItem) {
+        writePasteboard(it)
+        if let idx = items.firstIndex(where: { $0.id == it.id }), idx != 0 {
+            let moved = items.remove(at: idx)
+            items.insert(moved, at: 0)
+            persist()
+        }
+    }
+
+    // Headless (lumo://clip/prev): grab the PREVIOUS item → it becomes current and
+    // floats to the top. Press again to swap back. No panel shown.
+    func copyPrevious() {
+        guard items.count >= 2 else { return }
+        select(items[1])
+    }
+
+    func delete(_ it: ClipItem) {
+        if it.kind == .image, let f = it.file { try? FileManager.default.removeItem(at: fileURL(f)) }
+        items.removeAll { $0.id == it.id }
+        persist()
+    }
+
+    // Text → a new nvim tab (replaces Hammerspoon Hyper+V).
+    func pasteToVim(_ it: ClipItem) {
+        guard it.kind == .text, let text = it.text else { return }
+        let sock = "/tmp/nvimsocket2"
+        guard FileManager.default.fileExists(atPath: sock) else { return }
+        let tmp = NSTemporaryDirectory() + "lumo-clip-\(UUID().uuidString.prefix(6)).txt"
+        try? text.write(toFile: tmp, atomically: true, encoding: .utf8)
+        let nvr = NSHomeDirectory() + "/Library/Python/3.14/bin/nvr"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-lc", "'\(nvr)' --servername '\(sock)' --remote-tab-silent '\(tmp)'"]
+        try? p.run()
+    }
+
+    // Persist NON-secret items only — secrets never touch disk.
+    private func persist() {
+        let durable = items.filter { $0.expiresAt == nil && !$0.secret }
+        if let data = try? JSONEncoder().encode(durable) { try? data.write(to: indexURL) }
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: indexURL),
+              let arr = try? JSONDecoder().decode([ClipItem].self, from: data) else { return }
+        items = arr.filter { it in
+            if it.kind == .image, let f = it.file { return FileManager.default.fileExists(atPath: fileURL(f).path) }
+            return it.text != nil
+        }
+    }
+
+    // While querying, hide images and fuzzy-rank text matches.
+    var filtered: [ClipItem] {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty { return items }
+        return items.filter { $0.kind == .text }
+            .compactMap { it -> (ClipItem, Int)? in
+                guard let t = it.text, let s = memeFuzzy(q, t) else { return nil }
+                return (it, s)
+            }
+            .sorted { $0.1 > $1.1 }
+            .map { $0.0 }
+    }
+}
+
+struct ClipboardTab: View {
+    @ObservedObject var model: ClipboardModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(Gruv.fg4)
+                FocusedTextField(text: $model.search, placeholder: "Search clipboard…",
+                                 onSubmit: { if let f = model.filtered.first { pick(f) } })
+                Text("\(model.filtered.count)").font(.caption2).foregroundStyle(Gruv.gray)
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Gruv.bg1.opacity(0.6)))
+
+            if model.filtered.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "doc.on.clipboard").font(.title2).foregroundStyle(Gruv.fg4)
+                    Text(model.items.isEmpty ? "Copy something — it shows up here" : "No match")
+                        .font(.caption).foregroundStyle(Gruv.gray)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 4) {
+                        ForEach(model.filtered) { row($0) }
+                    }.padding(.vertical, 2)
+                }
+            }
+        }
+    }
+
+    private func row(_ it: ClipItem) -> some View {
+        HStack(spacing: 8) {
+            if it.kind == .image, let f = it.file {
+                MemeThumb(url: model.fileURL(f))
+                    .frame(width: 54, height: 38)
+                    .background(Color.black.opacity(0.2))
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                Spacer(minLength: 0)
+            } else {
+                Image(systemName: it.secret ? "lock.fill" : "text.alignleft")
+                    .font(.caption).frame(width: 18)
+                    .foregroundStyle(it.secret ? Gruv.yellow : Gruv.fg4)
+                Text(preview(it))
+                    .font(.system(size: 12, design: it.secret ? .default : .monospaced))
+                    .foregroundStyle(it.secret ? Gruv.yellow : Gruv.fg1)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+                if it.secret, let exp = it.expiresAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text("\(max(0, Int(exp.timeIntervalSince(ctx.date).rounded(.up))))s")
+                            .font(.system(size: 9).monospacedDigit()).foregroundStyle(Gruv.gray)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 5).padding(.horizontal, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Gruv.bg1.opacity(0.35)))
+        .contentShape(Rectangle())
+        .onTapGesture { pick(it) }
+        .contextMenu {
+            Button("Copy") { model.select(it) }
+            if it.kind == .text { Button("→ vim") { model.pasteToVim(it); dismiss() } }
+            Divider()
+            Button("Delete", role: .destructive) { model.delete(it) }
+        }
+    }
+
+    private func preview(_ it: ClipItem) -> String {
+        switch it.kind {
+        case .image: return "🖼 image"
+        case .text:
+            let t = (it.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return it.secret ? "•••••• (concealed)" : t
+        }
+    }
+
+    private func pick(_ it: ClipItem) { model.select(it); dismiss() }
+    private func dismiss() { NotificationCenter.default.post(name: .lumoDismiss, object: nil) }
+}
+
 // MARK: - Floating panel that can become key (for Esc / focus dismissal)
 
 final class FloatingPanel: NSPanel {
@@ -3256,9 +3648,11 @@ final class PanelController {
     let ai = AIModel()
     let system = SystemModel()
     let memes = MemeLibrary()
+    let clipboard = ClipboardModel()
     private let panel: FloatingPanel
     private var clickMonitor: Any?
     private var keyMonitor: Any?
+    private var previousApp: NSRunningApplication?   // app that had focus before we showed
     private var cancellables = Set<AnyCancellable>()
     private let size = NSSize(width: 430, height: 600)
 
@@ -3273,7 +3667,7 @@ final class PanelController {
         visual.layer?.masksToBounds = true
         visual.frame = NSRect(origin: .zero, size: size)
 
-        let hosting = NSHostingView(rootView: PanelView(state: state, weather: weather, events: events, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, pi: pi, ai: ai, system: system, memes: memes))
+        let hosting = NSHostingView(rootView: PanelView(state: state, weather: weather, events: events, timer: timer, nowPlaying: nowPlaying, sound: sound, bluetooth: bluetooth, power: power, network: network, unifi: unifi, vpn: vpn, ha: ha, pi: pi, ai: ai, system: system, memes: memes, clipboard: clipboard))
         hosting.frame = visual.bounds
         hosting.autoresizingMask = [.width, .height]
         visual.addSubview(hosting)
@@ -3295,11 +3689,21 @@ final class PanelController {
             self?.hide()
         }
 
+        // Track the last externally-active app so hide() can hand focus back to it.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            if app.bundleIdentifier != Bundle.main.bundleIdentifier { self?.previousApp = app }
+        }
+
         // Poll now-playing only while the Music tab is open.
         state.$tab
             .receive(on: RunLoop.main)
             .sink { [weak self] tab in self?.updatePolling(forTab: tab) }
             .store(in: &cancellables)
+
+        clipboard.startMonitoring()   // clipboard history runs for the whole app lifetime, not tab-scoped
     }
 
     private func updatePolling(forTab tab: Tab) {
@@ -3315,6 +3719,7 @@ final class PanelController {
         if panel.isVisible && tab == .pi { pi.startPolling() } else { pi.stopPolling() }
         if panel.isVisible && tab == .ai { ai.startPolling() } else { ai.stopPolling() }
         if panel.isVisible && tab == .memes { memes.search = ""; memes.load(); NSApp.activate(ignoringOtherApps: true) }
+        if panel.isVisible && tab == .clipboard { clipboard.search = ""; NSApp.activate(ignoringOtherApps: true) }
     }
 
     func toggle(tab: Tab) {
@@ -3360,7 +3765,7 @@ final class PanelController {
         panel.alphaValue = 1
         panel.setFrameOrigin(NSPoint(x: final.x, y: final.y + size.height))   // start fully above
         panel.makeKeyAndOrderFront(nil)
-        if state.tab == .memes { NSApp.activate(ignoringOtherApps: true) }   // text fields need the app active for keyboard focus
+        if state.tab == .memes || state.tab == .clipboard { NSApp.activate(ignoringOtherApps: true) }   // text fields need the app active for keyboard focus
         animateOrigin(to: final, duration: 0.34, curve: Self.easeOutBack)
         installMonitors()
         updatePolling(forTab: state.tab)
@@ -3369,6 +3774,7 @@ final class PanelController {
     private func hide() {
         removeMonitors()
         stopAllPolling()
+        if NSApp.isActive { previousApp?.activate() }   // hand focus back to the app you came from
         let final = topRightOrigin()
         animateOrigin(to: NSPoint(x: final.x, y: final.y + size.height),
                       duration: 0.16, curve: Self.easeInQuad) { [weak self] in
@@ -3421,6 +3827,165 @@ final class PanelController {
     }
 }
 
+// MARK: - Quake terminal controller (replaces Hammerspoon's Ctrl+' toggle)
+//
+// Toggles a drop-down kitty window titled "quake-terminal" via the Accessibility
+// API. The quake kitty runs as its OWN process (kitty --instance-group quake), so
+// hiding "its" app doesn't disturb the main kitty. Triggered by lumo://quake.
+
+final class QuakeController {
+    static let shared = QuakeController()
+
+    private let quakeTitle = "quake-terminal"
+    private let launcher = NSHomeDirectory() + "/.config/kitty/kitty-quake"
+    private let topGap: CGFloat = 40          // clear SketchyBar so it stays visible
+    private var refocusWork: [DispatchWorkItem] = []
+    private var quakePID: pid_t?              // the one kitty process we manage (stable for its lifetime)
+    private var isShown = false               // OUR authoritative state — we're the sole controller
+
+    func toggle() {
+        guard ensureTrusted() else { qlog("NOT TRUSTED"); return }  // first run prompts for Accessibility
+        guard let app = quakeApp() else {
+            qlog("branch=LAUNCH (no live quake process)"); isShown = true; launch(); discoverPIDThenShow(); return
+        }
+        if isShown {
+            qlog("branch=HIDE (pid \(app.processIdentifier))")
+            app.hide(); isShown = false
+        } else {
+            qlog("branch=SHOW (pid \(app.processIdentifier))")
+            if let win = quakeWindow(of: app) {
+                show(app: app, win: win)
+            } else {
+                launch(); discoverPIDThenShow()   // window was closed; recreate
+            }
+            isShown = true
+        }
+    }
+
+    // Resolve the kitty process we manage, by tracked PID; rediscover via the
+    // /tmp/mykitty-quake-<PID> socket the launcher creates if our PID is stale.
+    private func quakeApp() -> NSRunningApplication? {
+        if let pid = quakePID, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated {
+            return app
+        }
+        if let pid = discoverQuakePID(), let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated {
+            quakePID = pid; return app
+        }
+        quakePID = nil; return nil
+    }
+
+    private func discoverQuakePID() -> pid_t? {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: "/tmp") else { return nil }
+        for f in files where f.hasPrefix("mykitty-quake-") {
+            if let pid = pid_t(f.dropFirst("mykitty-quake-".count)),
+               let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated {
+                return pid
+            }
+        }
+        return nil
+    }
+
+    private func discoverPIDThenShow() {
+        for delay in [0.5, 1.0, 1.5, 2.0, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, let app = self.quakeApp(), let win = self.quakeWindow(of: app) else { return }
+                self.show(app: app, win: win); self.isShown = true
+            }
+        }
+    }
+
+    private func qlog(_ s: String) {
+        let line = "[\(Date())] \(s)\n"
+        if let h = FileHandle(forWritingAtPath: "/tmp/lumo-quake.log") {
+            h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile()
+        } else { try? line.write(toFile: "/tmp/lumo-quake.log", atomically: true, encoding: .utf8) }
+    }
+
+    // MARK: trust
+    @discardableResult
+    private func ensureTrusted() -> Bool {
+        AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+    }
+
+    // MARK: discovery — the kitty *process* that owns the quake window
+    private func quakeWindow(of app: NSRunningApplication) -> AXUIElement? {
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        return windows.first { axString($0, kAXTitleAttribute) == quakeTitle }
+    }
+
+    // MARK: show / position / focus
+    private func show(app: NSRunningApplication, win: AXUIElement) {
+        if app.isHidden { app.unhide() }
+        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        position(win)
+        app.activate()
+        raiseFocus(win)
+        armRefocusGuard(app: app, win: win)
+    }
+
+    private func position(_ win: AXUIElement) {
+        let screen = activeScreen()
+        let vf = screen.visibleFrame                       // excludes menu bar / dock
+        let width = vf.width * 0.8
+        let height = vf.height * 0.5
+        let x = vf.minX + (vf.width - width) / 2
+        let cocoaTop = vf.maxY - topGap                    // window top edge (Cocoa, bottom-left origin)
+        // AX uses a top-left global origin anchored on the primary display → flip Y.
+        let primaryHeight = (NSScreen.screens.first { $0.frame.origin == .zero } ?? screen).frame.height
+        var pos = CGPoint(x: x, y: primaryHeight - cocoaTop)
+        var size = CGSize(width: width, height: height)
+        if let p = AXValueCreate(.cgPoint, &pos) {
+            AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, p)
+        }
+        if let s = AXValueCreate(.cgSize, &size) {
+            AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, s)
+        }
+    }
+
+    private func raiseFocus(_ win: AXUIElement) {
+        AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(win, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    }
+
+    // Port of Hammerspoon's focus-guard: macOS Tahoe hands focus back to a "main"
+    // kitty window 0.06–1.5s after toggle-on, so re-assert focus across that window.
+    private func armRefocusGuard(app: NSRunningApplication, win: AXUIElement) {
+        refocusWork.forEach { $0.cancel() }; refocusWork.removeAll()
+        for delay in [0.06, 0.15, 0.30, 0.6, 1.0, 1.5] {
+            let work = DispatchWorkItem { [weak self] in
+                app.activate()
+                self?.raiseFocus(win)
+            }
+            refocusWork.append(work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
+
+    // MARK: launch (cold start / warm relaunch handled by the script), then show
+    private func launch() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-lc", launcher]
+        try? p.run()
+    }
+
+    // MARK: AX helpers
+    private func activeScreen() -> NSScreen {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main ?? NSScreen.screens[0]
+    }
+    private func axString(_ el: AXUIElement, _ attr: String) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+        return v as? String
+    }
+}
+
 // MARK: - App delegate (URL scheme entry point)
 
 final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelegate {
@@ -3454,10 +4019,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelega
     }
 
     private func handle(_ url: URL) {
+        // Headless clipboard actions (no panel shown): lumo://clip/prev
+        if url.host == "clip" {
+            if (url.pathComponents.last ?? "") == "prev" { controller.clipboard.copyPrevious() }
+            return
+        }
         // Accept both  lumo://tab/calendar  and  lumo://calendar
         let raw = (url.host == "tab" ? url.pathComponents.last : url.host) ?? ""
         let name = raw.lowercased()
         try? "\(name)\n".append(toFile: "/tmp/lumo.log")
+        // Quake terminal ON HOLD — Hammerspoon (Ctrl+') handles it for now. QuakeController
+        // is kept dormant; re-enable by uncommenting the two lines below.
+        // if name == "quake" { QuakeController.shared.toggle(); return }
         if let tab = Tab(rawValue: name) {
             controller.toggle(tab: tab)
         } else {
