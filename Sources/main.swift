@@ -91,15 +91,21 @@ enum Tab: String, CaseIterable, Identifiable {
     }
 }
 
-// config.json (optional): { "enabledModules": ["calendar","clipboard",…] } — same
-// names as lumo://tab/<name>. Missing/empty → all modules enabled.
-let enabledModules: Set<Tab> = {
+// config.json (optional): { "enabledModules": ["calendar",…], "menuBarIcon": true }
+// "enabledModules" uses the same names as lumo://tab/<name>.
+private let appConfig: [String: Any] = {
     guard let d = try? Data(contentsOf: URL(fileURLWithPath: lumoConfigDir + "/config.json")),
-          let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-          let names = j["enabledModules"] as? [String] else { return Set(Tab.allCases) }
+          let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return [:] }
+    return j
+}()
+let enabledModules: Set<Tab> = {
+    guard let names = appConfig["enabledModules"] as? [String] else { return Set(Tab.allCases) }
     let tabs = names.compactMap { Tab(rawValue: $0.lowercased()) }
     return tabs.isEmpty ? Set(Tab.allCases) : Set(tabs)
 }()
+// Menu-bar launch trigger — on by default so a fresh install is usable without
+// sketchybar; set "menuBarIcon": false to hide it (e.g. if you summon elsewhere).
+let menuBarEnabled = (appConfig["menuBarIcon"] as? Bool) ?? true
 
 // MARK: - Launch another app + dismiss the panel
 
@@ -4042,6 +4048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelega
     let controller = PanelController()
     private var btManager: CBCentralManager?
     private let locationManager = CLLocationManager()
+    private var statusItem: NSStatusItem?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
@@ -4058,6 +4065,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelega
         btManager = CBCentralManager(delegate: self, queue: nil)
         // Location authorization is required by macOS to scan for Wi-Fi networks.
         locationManager.requestWhenInUseAuthorization()
+        setupMenuBar()
+    }
+
+    // Optional menu-bar icon (config "menuBarIcon", default on) → makes Lumo
+    // summonable without sketchybar/Raycast, the main shareability blocker.
+    private func setupMenuBar() {
+        guard menuBarEnabled else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "square.grid.2x2.fill", accessibilityDescription: "Lumo")
+        let menu = NSMenu()
+        for tab in Tab.allCases where enabledModules.contains(tab) {
+            let mi = NSMenuItem(title: tab.title, action: #selector(openTab(_:)), keyEquivalent: "")
+            mi.representedObject = tab; mi.target = self
+            menu.addItem(mi)
+        }
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Lumo", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func openTab(_ sender: NSMenuItem) {
+        guard let tab = sender.representedObject as? Tab else { return }
+        controller.toggle(tab: tab)
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {}
