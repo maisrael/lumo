@@ -1,3 +1,11 @@
+# 🚚 This project has moved — **Lumo is now Kajo**
+
+### → New home: **https://github.com/Mangust1/kajo**
+
+This repository is **archived and no longer maintained**. Lumo was renamed to **Kajo** (to avoid a name clash) and all development continues in the new repo. Please update your bookmarks.
+
+---
+
 <p align="center">
   <img src="assets/lumo-banner.png" alt="Lumo" width="660">
 </p>
